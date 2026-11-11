@@ -760,7 +760,7 @@ async def compute_kpi_aggregates(session: AsyncSession) -> dict[str, Any]:
         "total_trapped_working_capital": str(trapped),
         "dollars_reconciled": str(reconciled),
         "dollars_requiring_review": str(review),
-        "currency": "INR",
+        "currency": "USD",
     }
 
 

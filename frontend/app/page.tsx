@@ -293,6 +293,7 @@ const FailureReasonRenderer = (params: ICellRendererParams<FinancialGridRow>) =>
 
   const isPending =
     status === "PENDING" ||
+    status === "PENDING_APPROVAL" ||
     status === "EXECUTING" ||
     status === "PROPOSED" ||
     status === "REVIEW_REQUIRED";
@@ -329,21 +330,35 @@ interface CustomTooltipProps {
 const CustomTooltip: React.FC<CustomTooltipProps> = ({ active, payload, label }) => {
   if (active && payload && payload.length) {
     const data = payload[0].payload;
-    const statusName = label || data?.name || "STATUS";
+    const statusName = String(label || data?.name || "STATUS").toUpperCase();
     const volume = data?.volume ?? data?.value ?? 0;
     const count = data?.count ?? 0;
+    const curr = data?.currency || "USD";
 
-    const statusBadgeMap: Record<string, { text: string; bg: string; dot: string }> = {
-      SETTLED: { text: "text-emerald-400", bg: "bg-emerald-950/80 border-emerald-700/60", dot: "bg-emerald-400" },
-      PENDING: { text: "text-amber-400", bg: "bg-amber-950/80 border-amber-700/60", dot: "bg-amber-400" },
-      FAILED: { text: "text-rose-400", bg: "bg-rose-950/80 border-rose-700/60", dot: "bg-rose-400" },
-    };
+    const isSettled = statusName.includes("SETTLE") || statusName.includes("EXECUTE") || statusName.includes("PAID") || statusName.includes("MATCH");
+    const isFailed = statusName.includes("FAIL") || statusName.includes("UNMATCH") || statusName.includes("DLQ") || statusName.includes("REJECT") || statusName.includes("DISPUTE");
+    const isPending = statusName.includes("PEND") || statusName.includes("PROPOS") || statusName.includes("REVIEW");
 
-    const badge = statusBadgeMap[statusName] || {
-      text: "text-sky-400",
-      bg: "bg-sky-950/80 border-sky-700/60",
-      dot: "bg-sky-400",
-    };
+    const badge = isSettled
+      ? { text: "text-emerald-400", bg: "bg-emerald-950/80 border-emerald-700/60", dot: "bg-emerald-400" }
+      : isFailed
+      ? { text: "text-rose-400", bg: "bg-rose-950/80 border-rose-700/60", dot: "bg-rose-400" }
+      : isPending
+      ? { text: "text-amber-400", bg: "bg-amber-950/80 border-amber-700/60", dot: "bg-amber-400" }
+      : { text: "text-sky-400", bg: "bg-sky-950/80 border-sky-700/60", dot: "bg-sky-400" };
+
+    let formattedVolume = "$0.00";
+    try {
+      formattedVolume = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: curr,
+      }).format(Number(volume));
+    } catch {
+      formattedVolume = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+      }).format(Number(volume));
+    }
 
     return (
       <div className="bg-slate-900/90 border border-slate-700 backdrop-blur-md rounded-lg p-3 shadow-2xl font-mono min-w-[220px] text-xs">
@@ -361,7 +376,7 @@ const CustomTooltip: React.FC<CustomTooltipProps> = ({ active, payload, label })
           <div className="flex items-center justify-between text-slate-400">
             <span>VOLUME:</span>
             <span className="font-bold text-slate-100 text-[13px]">
-              ₹{Number(volume).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              {formattedVolume}
             </span>
           </div>
           <div className="flex items-center justify-between text-slate-400">
@@ -458,65 +473,79 @@ export default function FinancialStudioCommandCenter() {
     setIsMounted(true);
   }, []);
 
+  // Derived active currency from loaded grid rows (defaults to USD)
+  const activeCurrency = useMemo(() => {
+    const found = rowData.find((r) => r.currency && r.currency.trim());
+    return (found?.currency || "USD").toUpperCase();
+  }, [rowData]);
+
   // Metric Ribbon State
   const [metrics, setMetrics] = useState<MetricRibbonData>({
-    totalVolume: "₹ 14,850,200.00",
+    totalVolume: "$ 14,850,200.00",
     pendingPayouts: 3,
     activeLocks: 2,
     dlqCount: 1,
   });
 
-  // Derived state: aggregate volume and counts by erp_status from rowData for Recharts
+  // Derived state: dynamic aggregation mapped strictly from normalized erp_status sent by backend
   const statusChartData = useMemo(() => {
-    let settledTotal = 0;
-    let settledCount = 0;
-    let pendingTotal = 0;
-    let pendingCount = 0;
-    let failedTotal = 0;
-    let failedCount = 0;
+    const statusMap = new Map<string, { volume: number; count: number }>();
 
     rowData.forEach((row) => {
       const rawStatus = (row.erp_status || "PENDING").toUpperCase().trim();
       const cleanAmt = String(row.amount || "0").replace(/[^0-9.-]/g, "");
       const val = parseFloat(cleanAmt) || 0;
 
-      if (
-        rawStatus === "SETTLED" ||
-        rawStatus === "EXECUTED" ||
-        rawStatus === "PAID" ||
-        rawStatus === "MATCHED" ||
-        rawStatus === "POSTED" ||
-        rawStatus === "SUCCESS"
-      ) {
-        settledTotal += val;
-        settledCount += 1;
-      } else if (
-        rawStatus === "FAILED" ||
-        rawStatus === "DLQ" ||
-        rawStatus.includes("DISPUTE") ||
-        rawStatus === "REJECTED" ||
-        rawStatus === "ERROR"
-      ) {
-        failedTotal += val;
-        failedCount += 1;
-      } else {
-        pendingTotal += val;
-        pendingCount += 1;
-      }
+      const current = statusMap.get(rawStatus) || { volume: 0, count: 0 };
+      current.volume = Math.round((current.volume + val) * 100) / 100;
+      current.count += 1;
+      statusMap.set(rawStatus, current);
     });
 
-    settledTotal = Math.round(settledTotal * 100) / 100;
-    pendingTotal = Math.round(pendingTotal * 100) / 100;
-    failedTotal = Math.round(failedTotal * 100) / 100;
+    const preferredOrder = ["SETTLED", "PENDING_APPROVAL", "PENDING", "FAILED", "UNMATCHED"];
+    const presentKeys = Array.from(statusMap.keys());
+    const orderedKeys = Array.from(
+      new Set([...preferredOrder.filter((s) => statusMap.has(s)), ...presentKeys])
+    );
 
-    const chartData = [
-      { name: "SETTLED", volume: settledTotal, value: settledTotal, count: settledCount, fill: "url(#settledGradient)", stroke: "#22c55e" },
-      { name: "PENDING", volume: pendingTotal, value: pendingTotal, count: pendingCount, fill: "url(#pendingGradient)", stroke: "#eab308" },
-      { name: "FAILED", volume: failedTotal, value: failedTotal, count: failedCount, fill: "url(#failedGradient)", stroke: "#ef4444" },
-    ];
+    if (orderedKeys.length === 0) {
+      orderedKeys.push("SETTLED", "PENDING_APPROVAL", "FAILED");
+    }
 
-    return chartData;
-  }, [rowData]);
+    return orderedKeys.map((name) => {
+      const data = statusMap.get(name) || { volume: 0, count: 0 };
+      const isSettled =
+        name.includes("SETTLE") ||
+        name.includes("EXECUTE") ||
+        name.includes("PAID") ||
+        name.includes("MATCH") ||
+        name.includes("SUCCESS");
+      const isFailed =
+        name.includes("FAIL") ||
+        name.includes("UNMATCH") ||
+        name.includes("DLQ") ||
+        name.includes("REJECT") ||
+        name.includes("DISPUTE") ||
+        name.includes("ERROR");
+
+      const fill = isSettled
+        ? "url(#settledGradient)"
+        : isFailed
+        ? "url(#failedGradient)"
+        : "url(#pendingGradient)";
+      const stroke = isSettled ? "#22c55e" : isFailed ? "#ef4444" : "#eab308";
+
+      return {
+        name,
+        volume: data.volume,
+        value: data.volume,
+        count: data.count,
+        currency: activeCurrency,
+        fill,
+        stroke,
+      };
+    });
+  }, [rowData, activeCurrency]);
 
   const getStatusColor = useCallback((name: string) => {
     const s = name.toUpperCase();
@@ -584,7 +613,7 @@ export default function FinancialStudioCommandCenter() {
             timestamp: r.timestamp || r.matched_at || r.created_at || new Date().toISOString(),
             vendor_email: r.vendor_email || r.vendor_name || r.proposer || "N/A",
             amount: String(r.amount || r.settled_amount || r.erp_amount || "0.00"),
-            currency: r.currency || "INR",
+            currency: r.currency || "USD",
             erp_status: r.erp_status || r.match_status || r.status || "PENDING",
             notes: r.notes || r.review_notes || r.variance_category || "—",
             failure_reason: r.failure_reason || (r.erp_status === "FAILED" ? r.notes : null),
@@ -595,10 +624,12 @@ export default function FinancialStudioCommandCenter() {
 
         setRowData(mapped);
 
+        const detectedCurr = mapped.find((r) => r.currency)?.currency || "USD";
+
         // Update executive KPI summary directly using backend kpi object
         if (json.kpi) {
           setMetrics({
-            totalVolume: json.kpi.totalVolume ?? "₹ 0.00",
+            totalVolume: json.kpi.totalVolume ?? new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(0),
             pendingPayouts: json.kpi.pendingPayouts ?? 0,
             activeLocks: json.kpi.activeLocks ?? 0,
             dlqCount: json.kpi.dlqCount ?? 0,
@@ -616,7 +647,7 @@ export default function FinancialStudioCommandCenter() {
           }).length;
 
           setMetrics({
-            totalVolume: `₹ ${total.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+            totalVolume: new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(total),
             pendingPayouts: pending,
             activeLocks: Math.max(1, Math.floor(pending / 2)),
             dlqCount: dlq,
@@ -639,7 +670,7 @@ export default function FinancialStudioCommandCenter() {
           timestamp: "2026-11-08T09:42:17Z",
           vendor_email: "billing@tcs.corp",
           amount: "485000.00",
-          currency: "INR",
+          currency: "USD",
           erp_status: "EXECUTED",
           notes: "Invoice auto-cleared against settlement",
         },
@@ -649,7 +680,7 @@ export default function FinancialStudioCommandCenter() {
           timestamp: "2026-11-08T10:14:02Z",
           vendor_email: "accounts@infosys.com",
           amount: "25.00",
-          currency: "INR",
+          currency: "USD",
           erp_status: "PENDING_APPROVAL",
           notes: "Four-Eyes approval required for FX variance",
         },
@@ -659,7 +690,7 @@ export default function FinancialStudioCommandCenter() {
           timestamp: "2026-11-08T11:05:44Z",
           vendor_email: "finance@hcl.com",
           amount: "128450.00",
-          currency: "INR",
+          currency: "USD",
           erp_status: "PENDING_APPROVAL",
           notes: "Awaiting GL matching token",
         },
@@ -669,10 +700,10 @@ export default function FinancialStudioCommandCenter() {
           timestamp: "2026-11-08T11:22:19Z",
           vendor_email: "ap@wipro.com",
           amount: "64000.00",
-          currency: "INR",
+          currency: "USD",
           erp_status: "FAILED",
-          notes: "CRITICAL AMOUNT DELTA: Variance of ₹+1,250.00 exceeds threshold (₹25.00 limit).",
-          failure_reason: "FX Variance Limit Breached: Δ₹1,250",
+          notes: "CRITICAL AMOUNT DELTA: Variance of $+1,250.00 exceeds threshold ($25.00 limit).",
+          failure_reason: "FX Variance Limit Breached: Δ$1,250",
         },
         {
           id: "row-5",
@@ -680,7 +711,7 @@ export default function FinancialStudioCommandCenter() {
           timestamp: "2026-11-08T11:30:00Z",
           vendor_email: "treasury@techmahindra.com",
           amount: "910200.00",
-          currency: "INR",
+          currency: "USD",
           erp_status: "EXECUTED",
           notes: "Auto-reconciled via SAP connector",
         },
@@ -734,7 +765,7 @@ export default function FinancialStudioCommandCenter() {
             timestamp: r.timestamp || r.matched_at || r.created_at || new Date().toISOString(),
             vendor_email: r.vendor_email || r.vendor_name || r.proposer || "N/A",
             amount: String(r.amount || r.settled_amount || r.erp_amount || "0.00"),
-            currency: r.currency || "INR",
+            currency: r.currency || "USD",
             erp_status: r.erp_status || r.match_status || r.status || "PENDING",
             notes: r.notes || r.review_notes || r.variance_category || "—",
             failure_reason: r.failure_reason || (r.erp_status === "FAILED" ? r.notes : null),
@@ -744,10 +775,12 @@ export default function FinancialStudioCommandCenter() {
 
           setRowData(mapped);
 
+          const detectedCurr = mapped.find((r) => r.currency)?.currency || "USD";
+
           // Update executive KPI summary directly from backend kpi object
           if (json.kpi) {
             setMetrics({
-              totalVolume: json.kpi.totalVolume ?? "₹ 0.00",
+              totalVolume: json.kpi.totalVolume ?? new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(0),
               pendingPayouts: json.kpi.pendingPayouts ?? 0,
               activeLocks: json.kpi.activeLocks ?? 0,
               dlqCount: json.kpi.dlqCount ?? 0,
@@ -795,7 +828,7 @@ export default function FinancialStudioCommandCenter() {
         timestamp: r.timestamp || new Date().toISOString(),
         vendor_email: r.vendor_email || "N/A",
         amount: String(r.amount || "0.00"),
-        currency: r.currency || "INR",
+        currency: r.currency || "USD",
         erp_status: r.erp_status || "PENDING",
         notes: r.notes || "—",
         failure_reason: r.failure_reason || (r.erp_status === "FAILED" ? r.notes : null),
@@ -809,6 +842,8 @@ export default function FinancialStudioCommandCenter() {
         gridApi.refreshCells();
       }
 
+      const detectedCurr = mapped.find((r) => r.currency)?.currency || "USD";
+
       // Dynamically compute metrics from reconciled dataset
       const total = mapped.reduce((acc, curr) => acc + (parseFloat(curr.amount) || 0), 0);
       const pending = mapped.filter((r) => {
@@ -821,7 +856,7 @@ export default function FinancialStudioCommandCenter() {
       }).length;
 
       setMetrics({
-        totalVolume: `₹ ${total.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        totalVolume: new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(total),
         pendingPayouts: pending,
         activeLocks: Math.max(1, Math.floor(pending / 2)),
         dlqCount: dlq,
@@ -836,7 +871,7 @@ export default function FinancialStudioCommandCenter() {
           id: `recon-${Date.now()}`,
           timestamp: new Date().toISOString(),
           role: "system",
-          content: `[DETERMINISTIC MATCH COMPLETE] Unified ${mapped.length} operational records. FX variances flagged (limit ₹25.00) & clearance verified.`,
+          content: `[DETERMINISTIC MATCH COMPLETE] Unified ${mapped.length} operational records. FX variances flagged (limit $25.00) & clearance verified.`,
         },
       ]);
     } catch (err: any) {
@@ -888,7 +923,7 @@ export default function FinancialStudioCommandCenter() {
         timestamp: r.timestamp || new Date().toISOString(),
         vendor_email: r.vendor_email || "N/A",
         amount: String(r.amount || "0.00"),
-        currency: r.currency || "INR",
+        currency: r.currency || "USD",
         erp_status: r.erp_status || "PENDING",
         notes: r.notes || "—",
         failure_reason: r.failure_reason || (r.erp_status === "FAILED" ? r.notes : null),
@@ -1618,7 +1653,7 @@ export default function FinancialStudioCommandCenter() {
 
       // 2. Resets the top KPI metrics to zero
       setMetrics({
-        totalVolume: "₹ 0.00",
+        totalVolume: new Intl.NumberFormat("en-US", { style: "currency", currency: activeCurrency || "USD" }).format(0),
         pendingPayouts: 0,
         activeLocks: 0,
         dlqCount: 0,
@@ -1698,8 +1733,9 @@ export default function FinancialStudioCommandCenter() {
           return s.includes("DLQ") || s.includes("FAIL") || s.includes("UNMATCHED") || s.includes("DISPUTE");
         }).length;
 
+        const detectedCurr = nextRows.find((r) => r.currency)?.currency || "USD";
         setMetrics({
-          totalVolume: `₹ ${total.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+          totalVolume: new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(total),
           pendingPayouts: pending,
           activeLocks: Math.max(0, Math.floor(pending / 2)),
           dlqCount: dlq,
@@ -1793,22 +1829,37 @@ export default function FinancialStudioCommandCenter() {
         type: "numericColumn",
         cellClass: "ag-right-aligned-cell font-mono text-xs font-semibold text-slate-100 text-right",
         valueFormatter: (params: ValueFormatterParams) => {
-          if (params.value === null || params.value === undefined || params.value === "") return "₹0.00";
-          const num = parseFloat(params.value);
-          return isNaN(num)
-            ? String(params.value)
-            : `₹${num.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+          const curr = params.data?.currency || "USD";
+          if (params.value === null || params.value === undefined || params.value === "") {
+            return new Intl.NumberFormat("en-US", { style: "currency", currency: curr }).format(0);
+          }
+          const num =
+            typeof params.value === "number"
+              ? params.value
+              : parseFloat(String(params.value).replace(/[^0-9.-]/g, ""));
+          if (isNaN(num)) return String(params.value);
+          try {
+            return new Intl.NumberFormat("en-US", { style: "currency", currency: curr }).format(num);
+          } catch {
+            return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(num);
+          }
         },
       },
       {
         headerName: "CUR",
         field: "currency",
-        filter: false,
-        floatingFilter: false,
+        colId: "currency",
+        filter: "agTextColumnFilter",
+        floatingFilter: true,
+        filterParams: {
+          buttons: ["reset", "apply"],
+          closeOnApply: true,
+          caseSensitive: false,
+        },
         width: 85,
         minWidth: 80,
         maxWidth: 110,
-        cellClass: "font-mono text-xs text-slate-400 text-center uppercase font-medium",
+        cellClass: "font-mono text-xs text-slate-300 text-center uppercase font-medium",
         enableRowGroup: true,
       },
       {
@@ -1849,6 +1900,10 @@ export default function FinancialStudioCommandCenter() {
         filter: "agSetColumnFilter",
         filterParams: {
           values: [
+            "FX Variance Limit Breached: Δ$50",
+            "FX Variance Limit Breached: Δ$50.00",
+            "FX Variance Limit Breached: Δ$100",
+            "FX Variance Limit Breached: Δ$100.00",
             "FX Variance Limit Breached: Δ₹50",
             "FX Variance Limit Breached: Δ₹50.00",
             "FX Variance Limit Breached: Δ₹100",
@@ -1874,8 +1929,9 @@ export default function FinancialStudioCommandCenter() {
       {
         headerName: "NOTES",
         field: "notes",
-        filter: false,
-        floatingFilter: false,
+        colId: "notes",
+        filter: "agTextColumnFilter",
+        floatingFilter: true,
         flex: 1,
         minWidth: 200,
         cellClass: "font-mono text-xs text-slate-400 truncate",
@@ -1888,8 +1944,8 @@ export default function FinancialStudioCommandCenter() {
   const defaultColDef = useMemo<ColDef>(() => {
     return {
       sortable: true,
-      filter: false, // Strict type-aware filtering: prevent generic text filters from bleeding into every column
-      floatingFilter: false,
+      filter: true,
+      floatingFilter: true,
       resizable: true,
       flex: 1,
       minWidth: 140,
@@ -1936,10 +1992,14 @@ export default function FinancialStudioCommandCenter() {
             rawCol === "invoice_amount"
           ) {
             targetCol = "amount";
-          } else if (rawCol === "failure_reason" || rawCol === "notes" || rawCol === "anomaly_type") {
+          } else if (rawCol === "failure_reason" || rawCol === "anomaly_type") {
             targetCol = "failure_reason";
+          } else if (rawCol === "notes") {
+            targetCol = "notes";
           } else if (rawCol === "vendor_email" || rawCol === "vendor") {
             targetCol = "vendor_email";
+          } else if (rawCol === "currency" || rawCol === "cur") {
+            targetCol = "currency";
           }
 
           const op = (f.operator || "eq").toLowerCase();
@@ -1957,6 +2017,22 @@ export default function FinancialStudioCommandCenter() {
               values: Array.isArray(val) ? val.map((v) => String(v).toUpperCase()) : [filterVal],
             };
           } else if (targetCol === "failure_reason") {
+            newModel["failure_reason"] = {
+              filterType: "set",
+              values: Array.isArray(val) ? val.map((v) => String(v)) : [String(val)],
+            };
+          } else if (targetCol === "currency") {
+            let textType = "equals";
+            if (op === "contains") textType = "contains";
+            else if (op === "startswith") textType = "startsWith";
+            else if (op === "endswith") textType = "endsWith";
+
+            newModel["currency"] = {
+              filterType: "text",
+              type: textType,
+              filter: String(val).toUpperCase(),
+            };
+          } else if (targetCol === "timestamp") {
             newModel["failure_reason"] = {
               filterType: "set",
               values: Array.isArray(val) ? val.map((v) => String(v)) : [String(val)],
@@ -2022,7 +2098,9 @@ export default function FinancialStudioCommandCenter() {
     if (reason.includes("INVALID_RECEIVER_ACCOUNT")) {
       plainExplanation = `Transaction ${tid} failed during PayPal settlement execution. Technical Root Cause: "${reason}". The PayPal Sandbox API rejected the settlement capture order because the specified vendor recipient account is either unregistered, invalid, or not authorized to accept payouts in sandbox mode.`;
     } else if (reason.includes("FX Variance Limit Breached") || reason.includes("CRITICAL AMOUNT DELTA") || reason.includes("Variance of")) {
-      plainExplanation = `Transaction ${tid} failed deterministic matching. Technical Root Cause: "${reason}". The foreign exchange delta between the ERP invoice amount and PayPal settlement stream exceeded the authorized tolerance limit (limit: ₹25.00). This critical threshold breach requires Four-Eyes escalation.`;
+      const rowCurr = row.currency || "USD";
+      const limitStr = new Intl.NumberFormat("en-US", { style: "currency", currency: rowCurr }).format(25);
+      plainExplanation = `Transaction ${tid} failed deterministic matching. Technical Root Cause: "${reason}". The foreign exchange delta between the ERP invoice amount and PayPal settlement stream exceeded the authorized tolerance limit (limit: ${limitStr}). This critical threshold breach requires Four-Eyes escalation.`;
     } else if (reason.includes("504") || reason.includes("Timeout")) {
       plainExplanation = `Transaction ${tid} failed during settlement execution. Technical Root Cause: "${reason}". The PayPal Sandbox payment gateway timed out after 30 seconds without returning a capture confirmation.`;
     } else {
@@ -2303,14 +2381,14 @@ export default function FinancialStudioCommandCenter() {
             target_table: "gold_reconciliation_matches",
             filters: [
               { column: "match_status", operator: "eq", value: "review_required" },
-              { column: "currency", operator: "eq", value: "INR" },
+              { column: "currency", operator: "eq", value: activeCurrency || "USD" },
             ],
             sorts: [{ column: "variance_amount", direction: "desc" }],
             limit: 50,
             sql_compiler: "SQLAlchemy Parameterised SELECT",
             execution_policy: "READ_ONLY_INTENT_ENFORCED",
             anomaly_detected:
-              "Invoice-to-settlement variance delta under threshold (₹25.00).",
+              "Invoice-to-settlement variance delta under threshold ($25.00).",
             suggested_action:
               "Post balancing ERP General Ledger entry via APIMatic client.",
           };
@@ -2364,7 +2442,7 @@ export default function FinancialStudioCommandCenter() {
               ],
               sql_compiler: "SQLAlchemy Parameterised SELECT",
               execution_policy: "READ_ONLY_INTENT_ENFORCED",
-              anomaly_detected: "Invoice-to-settlement variance delta breached threshold (₹25.00).",
+              anomaly_detected: "Invoice-to-settlement variance delta breached threshold ($25.00).",
               suggested_action: "Execute manual settlement adjustment or balancing GL entry.",
             };
             const matchingRows = rowData.filter((r) =>
@@ -2374,8 +2452,8 @@ export default function FinancialStudioCommandCenter() {
             fallbackUiPayload = {
               ui_type: "data_table",
               rows: matchingRows.length > 0 ? matchingRows : [
-                { transaction_id: "TXN-003", amount: "2450.00", failure_reason: "FX Variance Limit Breached (> ₹25.00 limit)", notes: "Invoice vs settlement delta ₹28.50" },
-                { transaction_id: "TXN-008", amount: "1850.00", failure_reason: "FX Variance Limit Breached (> ₹25.00 limit)", notes: "Delta ₹31.20" },
+                { transaction_id: "TXN-003", amount: "2450.00", currency: "USD", failure_reason: "FX Variance Limit Breached (> $25.00 limit)", notes: "Invoice vs settlement delta $28.50" },
+                { transaction_id: "TXN-008", amount: "1850.00", currency: "USD", failure_reason: "FX Variance Limit Breached (> $25.00 limit)", notes: "Delta $31.20" },
               ],
               columns: ["transaction_id", "amount", "notes"],
               total_count: 2,
@@ -3019,15 +3097,11 @@ export default function FinancialStudioCommandCenter() {
                 </span>
               </div>
               <div className="flex items-center gap-3 text-[10px] font-mono text-slate-500">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 bg-[#22c55e]" /> SETTLED
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 bg-[#eab308]" /> PENDING
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 bg-[#ef4444]" /> FAILED
-                </span>
+                {statusChartData.map((entry) => (
+                  <span key={entry.name} className="flex items-center gap-1.5">
+                    <span className="w-2 h-2" style={{ backgroundColor: entry.stroke }} /> {entry.name}
+                  </span>
+                ))}
               </div>
             </div>
 
@@ -3077,7 +3151,23 @@ export default function FinancialStudioCommandCenter() {
                       tick={{ fill: "#94a3b8", fontSize: 12 }}
                       axisLine={{ stroke: "#475569" }}
                       tickLine={{ stroke: "#475569" }}
-                      tickFormatter={(val: number) => `₹${val >= 1000 ? (val / 1000).toFixed(0) + "k" : val}`}
+                      tickFormatter={(val: number) => {
+                        try {
+                          return new Intl.NumberFormat("en-US", {
+                            style: "currency",
+                            currency: activeCurrency || "USD",
+                            notation: "compact",
+                            maximumFractionDigits: 1,
+                          }).format(val);
+                        } catch {
+                          return new Intl.NumberFormat("en-US", {
+                            style: "currency",
+                            currency: "USD",
+                            notation: "compact",
+                            maximumFractionDigits: 1,
+                          }).format(val);
+                        }
+                      }}
                     />
                     <Tooltip
                       content={<CustomTooltip />}
@@ -3093,32 +3183,18 @@ export default function FinancialStudioCommandCenter() {
                     />
                     <Bar
                       dataKey="volume"
-                      name="Volume (₹)"
+                      name={`Volume (${activeCurrency})`}
                       radius={[8, 8, 0, 0]}
                       filter="url(#terminalBarGlow)"
                     >
-                      {statusChartData.map((entry, index) => {
-                        const gradientFill =
-                          entry.name === "SETTLED"
-                            ? "url(#settledGradient)"
-                            : entry.name === "FAILED"
-                            ? "url(#failedGradient)"
-                            : "url(#pendingGradient)";
-                        const strokeColor =
-                          entry.name === "SETTLED"
-                            ? "#22c55e"
-                            : entry.name === "FAILED"
-                            ? "#ef4444"
-                            : "#eab308";
-                        return (
-                          <Cell
-                            key={`bar-cell-${index}`}
-                            fill={gradientFill}
-                            stroke={strokeColor}
-                            strokeWidth={1}
-                          />
-                        );
-                      })}
+                      {statusChartData.map((entry, index) => (
+                        <Cell
+                          key={`bar-cell-${index}`}
+                          fill={entry.fill}
+                          stroke={entry.stroke}
+                          strokeWidth={1}
+                        />
+                      ))}
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
@@ -3283,7 +3359,16 @@ export default function FinancialStudioCommandCenter() {
                         </span>
                         <span className="text-slate-600 text-xs font-mono">|</span>
                         <span className="text-xs font-mono text-slate-400">
-                          AMOUNT: <strong className="text-slate-200">{selectedRow.currency} {selectedRow.amount}</strong>
+                          AMOUNT: <strong className="text-slate-200">{(() => {
+                            try {
+                              return new Intl.NumberFormat("en-US", {
+                                style: "currency",
+                                currency: selectedRow.currency || "USD",
+                              }).format(parseFloat(String(selectedRow.amount || "0").replace(/[^0-9.-]/g, "")) || 0);
+                            } catch {
+                              return `${selectedRow.currency || "USD"} ${selectedRow.amount}`;
+                            }
+                          })()}</strong>
                         </span>
                         <span className="text-slate-600 text-xs font-mono">|</span>
                         <span className="text-xs font-mono text-slate-400">
@@ -3765,17 +3850,29 @@ export default function FinancialStudioCommandCenter() {
                         <thead className="bg-[#121622]/90 sticky top-0 border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-400 select-none">
                           <tr>
                             <th className="px-3 py-2 font-semibold text-slate-300">Transaction ID</th>
-                            <th className="px-3 py-2 font-semibold text-right text-slate-300">Amount (₹)</th>
+                            <th className="px-3 py-2 font-semibold text-right text-slate-300">Amount ({activeCurrency})</th>
                             <th className="px-3 py-2 font-semibold text-slate-300">Failure Reason / Notes</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/60 text-[11px]">
                           {msg.ui_payload.rows.map((row: any, rIdx: number) => {
                             const txnId = row.transaction_id || row.id || row.internal_invoice_id || row.paypal_transaction_id || `TXN-${rIdx + 1}`;
+                            const rowCurr = row.currency || activeCurrency || "USD";
                             const rawAmt = parseFloat(String(row.amount || row.settled_amount || row.invoice_amount || row.variance_amount || 0).replace(/[^0-9.-]+/g, ""));
-                            const formattedAmt = isNaN(rawAmt)
-                              ? "₹0.00"
-                              : `₹${rawAmt.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+                            const formattedAmt = (() => {
+                              const num = isNaN(rawAmt) ? 0 : rawAmt;
+                              try {
+                                return new Intl.NumberFormat("en-US", {
+                                  style: "currency",
+                                  currency: rowCurr,
+                                }).format(num);
+                              } catch {
+                                return new Intl.NumberFormat("en-US", {
+                                  style: "currency",
+                                  currency: "USD",
+                                }).format(num);
+                              }
+                            })();
                             const reasonNotes = row.failure_reason || row.notes || row.anomaly_type || row.review_notes || row.erp_status || "—";
                             const isError = /fail|invalid|error|breach/i.test(reasonNotes);
                             const isWarn = /variance|pending|review/i.test(reasonNotes);

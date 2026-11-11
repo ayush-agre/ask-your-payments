@@ -68,6 +68,7 @@ from ai_router import _SYSTEM_PROMPT, router as ai_investigation_router
 SYSTEM_PROMPT: str = _SYSTEM_PROMPT
 from config import settings
 from database import close_db, init_db
+from ingestion_worker import reconcile_erp_paypal_left_join
 
 # ---------------------------------------------------------------------------
 # POSTGRESQL ASYNCHRONOUS DATABASE ENGINE (asyncpg & SQLAlchemy / SQLModel)
@@ -506,7 +507,7 @@ async def paypal_webhook_handler(
     match_row: Optional[GoldReconciliationMatch] = None
     row_id_to_broadcast = str(uuid.uuid4())
     settled_amount = Decimal("0.00")
-    currency = "INR"
+    currency = "USD"
 
     if paypal_txn_id:
         # Check Silver PayPal transactions first to obtain match_id
@@ -666,140 +667,16 @@ async def run_deterministic_matching(
             "lastRow": len(rows_data),
         }
 
-    # Cross-reference each ERP row against PayPal rows
-    for erp_idx, erp_row in enumerate(active_erp):
-        inv_id = (
-            erp_row.get("internal_invoice_id")
-            or erp_row.get("transaction_id")
-            or erp_row.get("id")
-            or f"INV-{erp_idx + 1:04d}"
-        ).strip()
-        erp_amt = _parse_amt(erp_row.get("amount") or erp_row.get("erp_amount"))
-        erp_curr = (erp_row.get("currency") or "INR").strip().upper()
-        erp_stat = (erp_row.get("erp_status") or erp_row.get("status") or "").strip().upper()
-        vendor = erp_row.get("vendor_email") or erp_row.get("vendor_name") or "vendor@corp.internal"
-        ts = ensure_utc_datetime(erp_row.get("timestamp") or erp_row.get("created_at")).isoformat()
-
-        # Find matching PayPal transaction
-        matched_pp_idx: Optional[int] = None
-        matched_pp: Optional[Dict[str, Any]] = None
-
-        for pp_idx, pp_row in enumerate(active_paypal):
-            if pp_idx in matched_paypal_indices:
-                continue
-            pp_ref = (
-                pp_row.get("reference_invoice_id")
-                or pp_row.get("internal_invoice_id")
-                or pp_row.get("custom_id")
-                or ""
-            ).strip()
-            pp_txn = (pp_row.get("paypal_transaction_id") or pp_row.get("transaction_id") or "").strip()
-
-            # Rule 1: Exact Reference Invoice ID or Transaction ID Match
-            if (pp_ref and pp_ref == inv_id) or (pp_txn and pp_txn == inv_id):
-                matched_pp_idx = pp_idx
-                matched_pp = pp_row
-                break
-
-            # Rule 2: Secondary match on vendor email and amount within variance window
-            pp_vendor = (pp_row.get("vendor_email") or pp_row.get("payer_email") or "").strip().lower()
-            if pp_vendor and pp_vendor == vendor.strip().lower():
-                pp_val = _parse_amt(pp_row.get("settled_amount") or pp_row.get("amount"))
-                if abs(pp_val - erp_amt) <= Decimal("25.00"):
-                    matched_pp_idx = pp_idx
-                    matched_pp = pp_row
-                    break
-
-        if matched_pp and matched_pp_idx is not None:
-            matched_paypal_indices.add(matched_pp_idx)
-            pp_amt = _parse_amt(matched_pp.get("settled_amount") or matched_pp.get("amount"))
-            pp_id = matched_pp.get("paypal_transaction_id") or matched_pp.get("transaction_id") or "TXN-PP"
-            variance = pp_amt - erp_amt
-            abs_var = abs(variance)
-            failure_reason = None
-
-            # 1. Missing Status Check
-            if not erp_stat or erp_stat in ["UNKNOWN", "MISSING", "PENDING"]:
-                final_status = "PENDING_APPROVAL"
-                notes = f"Missing clearance status on ERP ledger. Settled in PayPal as {pp_id}."
-            # 2. FX Variance Check
-            elif abs_var > Decimal("0.00"):
-                curr_sym = "₹" if erp_curr == "INR" else ("$" if erp_curr == "USD" else f"{erp_curr} ")
-                if abs_var <= Decimal("25.00"):
-                    final_status = "PENDING_APPROVAL"
-                    notes = f"FX variance delta detected ({curr_sym}{variance:+.2f} / {curr_sym}25.00 limit). Four-Eyes approval required."
-                else:
-                    final_status = "FAILED"
-                    if abs_var == int(abs_var):
-                        formatted_delta = f"{int(abs_var):,}"
-                    else:
-                        formatted_delta = f"{abs_var:,.2f}"
-                    failure_reason = f"FX Variance Limit Breached: Δ{curr_sym}{formatted_delta}"
-                    notes = f"CRITICAL AMOUNT DELTA: Variance of {curr_sym}{variance:+.2f} exceeds threshold ({curr_sym}25.00 limit). {failure_reason}"
-            # 3. Clean Deterministic Match
-            else:
-                final_status = "SETTLED"
-                notes = f"Auto-reconciled: Deterministic match ({inv_id} ↔ {pp_id}). Zero variance."
-
-            unified_rows.append({
-                "id": str(uuid.uuid4()),
-                "transaction_id": inv_id,
-                "timestamp": ts,
-                "vendor_email": vendor,
-                "amount": str(erp_amt),
-                "currency": erp_curr,
-                "erp_status": final_status,
-                "notes": notes,
-                "failure_reason": failure_reason,
-                "proposer_email": "analyst_raghav@finops.corp",
-                "approver_email": None,
-            })
-        else:
-            # Unmatched ERP record
-            unified_rows.append({
-                "id": str(uuid.uuid4()),
-                "transaction_id": inv_id,
-                "timestamp": ts,
-                "vendor_email": vendor,
-                "amount": str(erp_amt),
-                "currency": erp_curr,
-                "erp_status": "PENDING",
-                "notes": "Unmatched ERP invoice: Awaiting external PayPal settlement stream.",
-                "failure_reason": None,
-                "proposer_email": "analyst_raghav@finops.corp",
-                "approver_email": None,
-            })
-
-    # Unmatched PayPal records (settlements without corresponding ERP invoice)
-    for pp_idx, pp_row in enumerate(active_paypal):
-        if pp_idx not in matched_paypal_indices:
-            pp_id = (
-                pp_row.get("paypal_transaction_id")
-                or pp_row.get("transaction_id")
-                or f"PP-ORPHAN-{pp_idx+1}"
-            ).strip()
-            pp_amt = _parse_amt(pp_row.get("settled_amount") or pp_row.get("amount"))
-            pp_curr = (pp_row.get("currency") or "INR").strip().upper()
-            pp_vendor = pp_row.get("vendor_email") or pp_row.get("payer_email") or "settlement_disbursement@paypal.com"
-            pp_ts = ensure_utc_datetime(pp_row.get("timestamp") or pp_row.get("transaction_timestamp")).isoformat()
-            orphan_failure = f"Unmatched PayPal settlement: Missing corresponding ERP invoice for {pp_id}."
-
-            unified_rows.append({
-                "id": str(uuid.uuid4()),
-                "transaction_id": pp_id,
-                "timestamp": pp_ts,
-                "vendor_email": pp_vendor,
-                "amount": str(pp_amt),
-                "currency": pp_curr,
-                "erp_status": "FAILED",
-                "notes": f"Unmatched PayPal settlement: No corresponding ERP invoice for {pp_id}.",
-                "failure_reason": orphan_failure,
-                "proposer_email": "analyst_raghav@finops.corp",
-                "approver_email": None,
-            })
+    # Deterministic LEFT JOIN reconciliation via pandas (strictly len(active_erp) rows)
+    unified_rows = reconcile_erp_paypal_left_join(active_erp, active_paypal)
 
     # Persist unified records into PostgreSQL Silver Transaction table
     try:
+        reconciled_txn_ids = [u["transaction_id"] for u in unified_rows]
+        if reconciled_txn_ids:
+            # Purge stale/orphaned records from previous runs that are not in the reconciled set
+            await db.execute(delete(Transaction).where(Transaction.transaction_id.notin_(reconciled_txn_ids)))
+
         for u in unified_rows:
             try:
                 amt = Decimal(u["amount"])
@@ -875,9 +752,11 @@ async def run_deterministic_matching(
     IN_MEMORY_LEDGER.clear()
     IN_MEMORY_LEDGER.extend(unified_rows)
 
+    matched_count = sum(1 for u in unified_rows if u.get("erp_status") in ("SETTLED", "PENDING_APPROVAL"))
+
     return {
         "status": "success",
-        "message": f"Deterministic matching completed: {len(active_erp)} ERP invoices vs. {len(active_paypal)} PayPal settlements.",
+        "message": f"Deterministic matching completed: {len(active_erp)} ERP invoices vs. {len(active_paypal)} PayPal settlements. Unified {len(unified_rows)} rows via deterministic LEFT JOIN.",
         "rows": unified_rows,
         "total": len(unified_rows),
         "lastRow": len(unified_rows),
@@ -885,7 +764,7 @@ async def run_deterministic_matching(
             "erp_total": len(active_erp),
             "paypal_total": len(active_paypal),
             "unified_total": len(unified_rows),
-            "matched_count": len(matched_paypal_indices),
+            "matched_count": matched_count,
         },
     }
 
@@ -969,21 +848,22 @@ async def upload_csv_files(
             rows = list(reader)
             filename_lower = (file.filename or "").lower()
 
-            if "erp" in filename_lower:
+            fieldnames = [str(col).lower() for col in (reader.fieldnames or [])]
+            if "erp_txn_id" in fieldnames or "internal_invoice_id" in fieldnames:
+                source_enum = IngestionSource.ERP_CSV
+                is_erp = True
+            elif any(k in col for col in fieldnames for k in ("erp_reference_id", "gross_amount", "paypal", "settled", "mc_gross")):
+                source_enum = IngestionSource.PAYPAL_SETTLEMENT_CSV
+                is_erp = False
+            elif "erp" in filename_lower:
                 source_enum = IngestionSource.ERP_CSV
                 is_erp = True
             elif "paypal" in filename_lower:
                 source_enum = IngestionSource.PAYPAL_SETTLEMENT_CSV
                 is_erp = False
             else:
-                # Fallback heuristic: check column names if filename doesn't contain erp or paypal
-                fieldnames = [str(col).lower() for col in (reader.fieldnames or [])]
-                if any("paypal" in col or "settled" in col for col in fieldnames):
-                    source_enum = IngestionSource.PAYPAL_SETTLEMENT_CSV
-                    is_erp = False
-                else:
-                    source_enum = IngestionSource.ERP_CSV
-                    is_erp = True
+                source_enum = IngestionSource.ERP_CSV
+                is_erp = True
 
             for row in rows:
                 row_dict = dict(row)
@@ -991,7 +871,9 @@ async def upload_csv_files(
                 payload_hash = hashlib.sha256(raw_payload_str.encode("utf-8")).hexdigest()
 
                 source_event_id = (
-                    row_dict.get("transaction_id")
+                    row_dict.get("erp_txn_id")
+                    or row_dict.get("erp_reference_id")
+                    or row_dict.get("transaction_id")
                     or row_dict.get("paypal_transaction_id")
                     or row_dict.get("internal_invoice_id")
                     or row_dict.get("invoice_id")
@@ -1013,6 +895,16 @@ async def upload_csv_files(
                 else:
                     paypal_rows.append(row_dict)
 
+        # Refresh BronzeEvent for uploaded sources so stale rows don't accumulate across uploads
+        uploaded_sources = set()
+        if erp_rows:
+            uploaded_sources.add(IngestionSource.ERP_CSV.value)
+        if paypal_rows:
+            uploaded_sources.add(IngestionSource.PAYPAL_SETTLEMENT_CSV.value)
+
+        for src in uploaded_sources:
+            await db.execute(delete(BronzeEvent).where(BronzeEvent.source == src))
+
         # ── Database-Level Deduplication via on_conflict_do_nothing ──────
         if bronze_entries_to_insert:
             stmt = (
@@ -1025,7 +917,11 @@ async def upload_csv_files(
             logger.info("Persisted %d raw CSV records to BronzeEvent store with database deduplication.", len(bronze_entries_to_insert))
 
         # Immediately after bronze ingestion, trigger deterministic matching engine
-        return await run_deterministic_matching(db, erp_rows=erp_rows, paypal_rows=paypal_rows)
+        return await run_deterministic_matching(
+            db,
+            erp_rows=erp_rows if erp_rows else None,
+            paypal_rows=paypal_rows if paypal_rows else None,
+        )
     except Exception as exc:
         try:
             await db.rollback()
@@ -1374,16 +1270,19 @@ async def get_grid_rows(
         total_count = len(mem_source)
 
     # 3. Calculate Executive KPI Metrics
-    all_res = await db.execute(select(Transaction.amount, Transaction.erp_status))
+    all_res = await db.execute(select(Transaction.amount, Transaction.erp_status, Transaction.currency))
     all_records = all_res.all()
 
     total_vol = Decimal("0.00")
     pending_count = 0
     dlq_count = 0
     settled_count = 0
+    found_curr: Optional[str] = None
 
     if all_records:
-        for r_amt, r_stat in all_records:
+        for r_amt, r_stat, r_curr in all_records:
+            if r_curr and found_curr is None:
+                found_curr = str(r_curr).strip().upper() or None
             try:
                 total_vol += Decimal(str(r_amt or "0.00"))
             except Exception:
@@ -1397,6 +1296,9 @@ async def get_grid_rows(
                 settled_count += 1
     elif IN_MEMORY_LEDGER:
         for r in IN_MEMORY_LEDGER:
+            r_curr = r.get("currency")
+            if r_curr and found_curr is None:
+                found_curr = str(r_curr).strip().upper() or None
             try:
                 total_vol += Decimal(str(r.get("amount") or "0.00"))
             except Exception:
@@ -1409,8 +1311,11 @@ async def get_grid_rows(
             elif "SETTLED" in st or "EXECUTED" in st or "MATCHED" in st or "PAID" in st:
                 settled_count += 1
 
+    primary_curr = found_curr or "USD"
+    curr_sym = "$" if primary_curr == "USD" else ("₹" if primary_curr == "INR" else f"{primary_curr} ")
     kpi = {
-        "totalVolume": f"₹ {total_vol.quantize(Decimal('0.01')):,.2f}",
+        "totalVolume": f"{curr_sym}{total_vol.quantize(Decimal('0.01')):,.2f}",
+        "currency": primary_curr,
         "pendingPayouts": pending_count,
         "activeLocks": max(1, pending_count // 2) if pending_count > 0 else 0,
         "dlqCount": dlq_count,

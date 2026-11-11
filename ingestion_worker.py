@@ -27,10 +27,14 @@ import hashlib
 import io
 import json
 import logging
+import math
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
+
+import pandas as pd
 
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -130,6 +134,297 @@ def _normalise_erp_status(raw: str) -> str:
     return mapping.get(raw.strip().lower(), raw.strip().upper())
 
 
+def _clean_val(val: Any) -> Any:
+    """Normalize None, float NaN, pandas NA, and stringified null/nan to None."""
+    if val is None:
+        return None
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    if isinstance(val, Decimal) and val.is_nan():
+        return None
+    if isinstance(val, str) and val.strip().lower() in ("", "nan", "none", "null", "<na>"):
+        return None
+    return val
+
+
+def _pick_row_val(row: Dict[str, Any], *keys: str) -> Any:
+    """Return the first non-null, non-NaN value from row for candidate keys."""
+    for k in keys:
+        v = _clean_val(row.get(k))
+        if v is not None:
+            return v
+    return None
+
+
+def _parse_money_decimal(val: Any) -> Decimal:
+    """Parse monetary value into Decimal, stripping currency symbols and whitespace."""
+    val = _clean_val(val)
+    if val is None:
+        return Decimal("0.00")
+    if isinstance(val, (int, float, Decimal)):
+        try:
+            d = Decimal(str(val))
+            if d.is_nan() or d.is_infinite():
+                return Decimal("0.00")
+            return d.quantize(Decimal("0.01"))
+        except Exception:
+            return Decimal("0.00")
+    raw = str(val).strip()
+    for sym in ("$", "₹", "€", "£", ","):
+        raw = raw.replace(sym, "")
+    try:
+        d = Decimal(raw.strip() or "0.00")
+        if d.is_nan() or d.is_infinite():
+            return Decimal("0.00")
+        return d.quantize(Decimal("0.01"))
+    except Exception:
+        return Decimal("0.00")
+
+
+def _pick_first_col(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    """Return the first column name that exists in df from candidates."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    col_lower_map = {c.lower(): c for c in df.columns}
+    for col in candidates:
+        if col.lower() in col_lower_map:
+            return col_lower_map[col.lower()]
+    return None
+
+
+def reconcile_erp_paypal_left_join(
+    erp_rows: Sequence[Dict[str, Any]],
+    paypal_rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Deterministic reconciliation merge engine using pandas LEFT JOIN:
+    - ERP rows form the primary ledger (Left Side).
+    - Joins ERP 'erp_txn_id' against PayPal 'erp_reference_id'.
+    - Yields EXACTLY len(erp_rows) reconciled records (no list concatenation or union).
+    - Normalizes PayPal 'gross_amount' and ERP 'amount'.
+    - Flags unmatched ERP records as 'FAILED' with failure_reason.
+    - Flags FX variances (> $25.00 limit) as 'FAILED', (<= $25.00) as 'PENDING_APPROVAL'.
+    - Normalizes the output schema for every row:
+      id, transaction_id, timestamp, vendor_email, amount, currency, erp_status,
+      notes, failure_reason, proposer_email, approver_email.
+    """
+    if not erp_rows:
+        return []
+
+    # 1. Load DataFrames
+    df_erp = pd.DataFrame([dict(r) for r in erp_rows])
+    df_pp = pd.DataFrame([dict(r) for r in paypal_rows]) if paypal_rows else pd.DataFrame()
+
+    # 2. Resolve ERP join key (erp_txn_id or aliases)
+    erp_key_col = _pick_first_col(
+        df_erp,
+        ["erp_txn_id", "internal_invoice_id", "transaction_id", "invoice_id", "txn_id", "id"],
+    )
+    if erp_key_col:
+        df_erp["_join_key"] = df_erp[erp_key_col].fillna("").astype(str).str.strip()
+    else:
+        df_erp["_join_key"] = [f"ERP-{idx + 1:04d}" for idx in range(len(df_erp))]
+
+    # 3. Resolve PayPal join key (erp_reference_id or aliases)
+    if not df_pp.empty:
+        pp_key_col = _pick_first_col(
+            df_pp,
+            [
+                "erp_reference_id",
+                "reference_invoice_id",
+                "custom_id",
+                "paypal_reference_id",
+                "reference_id",
+                "erp_txn_id",
+                "transaction_id",
+            ],
+        )
+        if pp_key_col:
+            df_pp["_join_key"] = df_pp[pp_key_col].fillna("").astype(str).str.strip()
+            df_pp = df_pp[df_pp["_join_key"] != ""]
+            # Deduplicate PayPal rows on join key to preserve 1:1 row count with ERP
+            df_pp = df_pp.drop_duplicates(subset=["_join_key"], keep="first")
+        else:
+            df_pp = df_pp.iloc[0:0].copy()
+            df_pp["_join_key"] = ""
+
+        # Prefix all PayPal columns (except _join_key) with _pp_ to prevent column collisions
+        rename_dict = {col: f"_pp_{col}" for col in df_pp.columns if col != "_join_key"}
+        df_pp = df_pp.rename(columns=rename_dict)
+
+        # 4. Perform deterministic LEFT JOIN
+        merged = pd.merge(df_erp, df_pp, on="_join_key", how="left")
+    else:
+        merged = df_erp.copy()
+
+    # Replace all pandas NaN / NA values with Python None before row iteration
+    merged = merged.astype(object).where(pd.notnull(merged), None)
+
+    unified_rows: List[Dict[str, Any]] = []
+
+    for idx, row in enumerate(merged.to_dict(orient="records")):
+        join_key = str(_clean_val(row.get("_join_key")) or "").strip()
+        txn_id = str(
+            _pick_row_val(
+                row,
+                "erp_txn_id",
+                "internal_invoice_id",
+                "transaction_id",
+                "invoice_id",
+                "id",
+            )
+            or join_key
+            or f"TXN-{idx + 1:04d}"
+        ).strip()
+
+        # Parse ERP amount (check amount, erp_amount, invoice_amount, gross_amount)
+        erp_amt_raw = _pick_row_val(
+            row,
+            "amount",
+            "erp_amount",
+            "invoice_amount",
+            "gross_amount",
+        )
+        erp_amt = _parse_money_decimal(erp_amt_raw)
+
+        # Parse Currency: read from ERP, fallback to PayPal, fallback to USD
+        raw_curr = (
+            _pick_row_val(
+                row,
+                "currency",
+                "_pp_currency",
+                "mc_currency",
+                "_pp_mc_currency",
+            )
+            or "USD"
+        )
+        curr = str(raw_curr).strip().upper()
+        if not curr or curr in ("—", "-", "NONE", "NULL", "NAN"):
+            curr = "USD"
+
+        # Vendor info
+        vendor = (
+            _pick_row_val(
+                row,
+                "vendor_email",
+                "vendor_name",
+                "_pp_vendor_email",
+                "_pp_payer_email",
+            )
+            or "vendor@corp.internal"
+        )
+
+        # Timestamp normalization
+        raw_ts = _pick_row_val(
+            row,
+            "timestamp",
+            "created_at",
+            "_pp_timestamp",
+            "_pp_transaction_timestamp",
+        )
+        ts_obj = _parse_timestamp(str(raw_ts or ""))
+        ts = ts_obj.isoformat()
+
+        # Check if matched with PayPal
+        pp_matched = False
+        pp_id = ""
+        pp_amt = Decimal("0.00")
+
+        if not df_pp.empty:
+            pp_ref = str(
+                _pick_row_val(
+                    row,
+                    "_pp_erp_reference_id",
+                    "_pp_reference_invoice_id",
+                    "_pp_custom_id",
+                )
+                or ""
+            ).strip()
+            pp_id = str(
+                _pick_row_val(
+                    row,
+                    "_pp_paypal_transaction_id",
+                    "_pp_transaction_id",
+                    "_pp_id",
+                )
+                or ""
+            ).strip()
+
+            # PayPal amount: check gross_amount FIRST as per prompt
+            pp_amt_raw = _pick_row_val(
+                row,
+                "_pp_gross_amount",
+                "_pp_settled_amount",
+                "_pp_amount",
+                "_pp_mc_gross",
+                "_pp_net_amount",
+            )
+            has_pp_amount = pp_amt_raw is not None
+
+            if (pp_ref and pp_ref == join_key) or pp_id or has_pp_amount:
+                pp_matched = True
+                pp_amt = _parse_money_decimal(pp_amt_raw)
+                if not pp_id:
+                    pp_id = f"PP-{join_key}"
+
+        # If ERP amount was 0 or unparsed, but PayPal had gross_amount, use PayPal gross_amount
+        if erp_amt == Decimal("0.00") and pp_matched and pp_amt > Decimal("0.00"):
+            erp_amt = pp_amt
+
+        curr_sym = "$" if curr == "USD" else ("₹" if curr == "INR" else f"{curr} ")
+
+        if not pp_matched:
+            # Unmatched ERP record: Flag as 'FAILED' as requested
+            status = "FAILED"
+            failure_reason = f"UNMATCHED_PAYPAL_SETTLEMENT: Missing erp_reference_id match for {txn_id}"
+            notes = f"Unmatched ERP record: No corresponding PayPal settlement found for {txn_id}."
+        else:
+            variance = pp_amt - erp_amt
+            abs_var = abs(variance)
+            raw_erp_stat = str(_pick_row_val(row, "erp_status", "status") or "").strip().upper()
+
+            if raw_erp_stat in ["UNKNOWN", "MISSING", "PENDING_SETTLEMENT"]:
+                status = "PENDING_APPROVAL"
+                failure_reason = None
+                notes = f"Missing clearance status on ERP ledger. Settled in PayPal as {pp_id}."
+            elif abs_var > Decimal("0.00"):
+                if abs_var <= Decimal("25.00"):
+                    status = "PENDING_APPROVAL"
+                    failure_reason = None
+                    notes = f"FX variance delta detected ({curr_sym}{variance:+.2f} / {curr_sym}25.00 limit). Four-Eyes approval required."
+                else:
+                    status = "FAILED"
+                    formatted_delta = f"{abs_var:,.2f}" if abs_var != int(abs_var) else f"{int(abs_var):,}"
+                    failure_reason = f"FX Variance Limit Breached: Δ{curr_sym}{formatted_delta}"
+                    notes = f"CRITICAL AMOUNT DELTA: Variance of {curr_sym}{variance:+.2f} exceeds threshold ({curr_sym}25.00 limit). {failure_reason}"
+            else:
+                status = "SETTLED"
+                failure_reason = None
+                notes = f"Auto-reconciled: Deterministic match ({txn_id} ↔ {pp_id}). Zero variance."
+
+        unified_rows.append({
+            "id": str(uuid.uuid4()),
+            "transaction_id": txn_id,
+            "timestamp": ts,
+            "vendor_email": str(vendor),
+            "amount": str(erp_amt),
+            "currency": curr,
+            "erp_status": status,
+            "notes": notes,
+            "failure_reason": failure_reason,
+            "proposer_email": "analyst@finops.corp",
+            "approver_email": None,
+        })
+
+    return unified_rows
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  1. BRONZE INGESTION (with deduplication)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -202,26 +497,50 @@ async def normalise_paypal_settlements(
     Transform Bronze PayPal settlement events into Silver normalised records.
 
     CSV columns mapped:
-      paypal_transaction_id  →  paypal_transaction_id
-      reference_invoice_id   →  reference_invoice_id
-      settled_amount         →  settled_amount  (Decimal)
-      fee_amount             →  fee_amount      (Decimal)
-      currency               →  currency        (ISO 4217)
-      timestamp              →  transaction_timestamp
+      paypal_transaction_id (or transaction_id) → paypal_transaction_id
+      erp_reference_id (or reference_invoice_id) → reference_invoice_id
+      gross_amount (or settled_amount / amount) → settled_amount (Decimal)
+      fee_amount (or fee) → fee_amount (Decimal)
+      currency (or mc_currency) → currency (ISO 4217)
+      timestamp (or transaction_timestamp) → transaction_timestamp
     """
     records: list[SilverPayPalTransaction] = []
 
     for event in bronze_events:
         row: dict = json.loads(event.raw_payload)
 
+        pp_id = str(
+            row.get("paypal_transaction_id")
+            or row.get("transaction_id")
+            or row.get("id")
+            or f"PP-{uuid.uuid4()}"
+        ).strip()
+        ref_id = str(
+            row.get("erp_reference_id")
+            or row.get("reference_invoice_id")
+            or row.get("custom_id")
+            or row.get("reference_id")
+            or ""
+        ).strip() or None
+        amt_raw = (
+            row.get("gross_amount")
+            or row.get("settled_amount")
+            or row.get("amount")
+            or row.get("mc_gross")
+            or "0.00"
+        )
+        fee_raw = row.get("fee_amount") or row.get("fee") or row.get("mc_fee") or "0.00"
+        curr_raw = row.get("currency") or row.get("mc_currency") or "USD"
+        ts_raw = row.get("timestamp") or row.get("transaction_timestamp") or row.get("payment_date")
+
         txn = SilverPayPalTransaction(
             bronze_event_id=event.id,
-            paypal_transaction_id=row["paypal_transaction_id"].strip(),
-            reference_invoice_id=row.get("reference_invoice_id", "").strip() or None,
-            settled_amount=_parse_decimal(row["settled_amount"]),
-            fee_amount=_parse_decimal(row["fee_amount"]),
-            currency=row["currency"].strip().upper(),
-            transaction_timestamp=_parse_timestamp(row["timestamp"]),
+            paypal_transaction_id=pp_id,
+            reference_invoice_id=ref_id,
+            settled_amount=_parse_money_decimal(amt_raw),
+            fee_amount=_parse_money_decimal(fee_raw),
+            currency=str(curr_raw).strip().upper(),
+            transaction_timestamp=_parse_timestamp(str(ts_raw)),
             record_type=RecordType.PAYMENT,
         )
 
@@ -248,28 +567,50 @@ async def normalise_erp_invoices(
     Transform Bronze ERP events into Silver normalised records.
 
     CSV columns mapped:
-      internal_invoice_id  →  internal_invoice_id
-      vendor_name          →  vendor_name
-      vendor_email         →  vendor_email  (nullable)
-      erp_amount           →  erp_amount    (Decimal)
-      currency             →  currency      (ISO 4217)
-      status               →  erp_status + erp_status_normalised
+      erp_txn_id (or internal_invoice_id) → internal_invoice_id
+      vendor_name (or vendor) → vendor_name
+      vendor_email → vendor_email (nullable)
+      amount (or erp_amount) → erp_amount (Decimal)
+      currency → currency (ISO 4217)
+      erp_status (or status) → erp_status + erp_status_normalised
     """
     records: list[SilverERPInvoice] = []
 
     for event in bronze_events:
         row: dict = json.loads(event.raw_payload)
 
-        raw_email = row.get("vendor_email", "").strip()
-        raw_status = row.get("status", "").strip()
+        inv_id = str(
+            row.get("erp_txn_id")
+            or row.get("internal_invoice_id")
+            or row.get("transaction_id")
+            or row.get("invoice_id")
+            or row.get("id")
+            or f"INV-{uuid.uuid4()}"
+        ).strip()
+        vendor = str(
+            row.get("vendor_name")
+            or row.get("vendor")
+            or row.get("vendor_email")
+            or "Unknown Vendor"
+        ).strip()
+        raw_email = str(row.get("vendor_email") or "").strip()
+        amt_raw = (
+            row.get("amount")
+            or row.get("erp_amount")
+            or row.get("invoice_amount")
+            or row.get("gross_amount")
+            or "0.00"
+        )
+        curr_raw = row.get("currency") or "USD"
+        raw_status = str(row.get("erp_status") or row.get("status") or "PENDING").strip()
 
         inv = SilverERPInvoice(
             bronze_event_id=event.id,
-            internal_invoice_id=row["internal_invoice_id"].strip(),
-            vendor_name=row["vendor_name"].strip(),
+            internal_invoice_id=inv_id,
+            vendor_name=vendor,
             vendor_email=raw_email if raw_email else None,
-            erp_amount=_parse_decimal(row["erp_amount"]),
-            currency=row["currency"].strip().upper(),
+            erp_amount=_parse_money_decimal(amt_raw),
+            currency=str(curr_raw).strip().upper(),
             erp_status=raw_status,
             erp_status_normalised=_normalise_erp_status(raw_status),
         )
