@@ -129,7 +129,12 @@ def _normalise_erp_status(raw: str) -> str:
     mapping = {
         "paid": "PAID",
         "pending settlement": "PENDING_SETTLEMENT",
+        "pending": "PENDING_APPROVAL",          # FIX: "pending" normalises to PENDING_APPROVAL
+        "pending_settlement": "PENDING_APPROVAL", # FIX: alternate form also maps to PENDING_APPROVAL
+        "awaiting approval": "PENDING_APPROVAL",  # FIX: human-readable variant
         "approved": "APPROVED",
+        "unknown": "PENDING_APPROVAL",            # FIX: unknown status awaits manager review
+        "missing": "PENDING_APPROVAL",            # FIX: missing status awaits manager review
     }
     return mapping.get(raw.strip().lower(), raw.strip().upper())
 
@@ -283,7 +288,10 @@ def reconcile_erp_paypal_left_join(
             or f"TXN-{idx + 1:04d}"
         ).strip()
 
-        # Parse ERP amount (check amount, erp_amount, invoice_amount, gross_amount)
+        # Parse ERP amount (check amount, erp_amount, invoice_amount, gross_amount).
+        # NOTE: _pick_row_val returns None when all candidate keys are null/NaN.
+        # We preserve the raw sentinel so the coalesce below can distinguish
+        # "ERP had a genuine zero" from "ERP amount was absent/null".
         erp_amt_raw = _pick_row_val(
             row,
             "amount",
@@ -291,6 +299,8 @@ def reconcile_erp_paypal_left_join(
             "invoice_amount",
             "gross_amount",
         )
+        # FIX (Coalesce): Track whether ERP amount was genuinely absent vs zero.
+        erp_amount_missing = erp_amt_raw is None
         erp_amt = _parse_money_decimal(erp_amt_raw)
 
         # Parse Currency: read from ERP, fallback to PayPal, fallback to USD
@@ -373,8 +383,10 @@ def reconcile_erp_paypal_left_join(
                 if not pp_id:
                     pp_id = f"PP-{join_key}"
 
-        # If ERP amount was 0 or unparsed, but PayPal had gross_amount, use PayPal gross_amount
-        if erp_amt == Decimal("0.00") and pp_matched and pp_amt > Decimal("0.00"):
+        # FIX (Coalesce): If ERP amount was null/missing OR parsed to zero while
+        # PayPal had a valid gross_amount, fall back to PayPal's amount.
+        # This prevents PayPal-only records from displaying "$0.00" in the grid.
+        if (erp_amount_missing or erp_amt == Decimal("0.00")) and pp_matched and pp_amt > Decimal("0.00"):
             erp_amt = pp_amt
 
         curr_sym = "$" if curr == "USD" else ("₹" if curr == "INR" else f"{curr} ")
@@ -389,7 +401,16 @@ def reconcile_erp_paypal_left_join(
             abs_var = abs(variance)
             raw_erp_stat = str(_pick_row_val(row, "erp_status", "status") or "").strip().upper()
 
-            if raw_erp_stat in ["UNKNOWN", "MISSING", "PENDING_SETTLEMENT"]:
+            # FIX: Normalise raw ERP status variants that map to PENDING_APPROVAL.
+            # "PENDING", "UNKNOWN", "MISSING", "PENDING_SETTLEMENT" all require
+            # manager sign-off, so they must surface as the exact string "PENDING_APPROVAL"
+            # so the AG Grid Manager filter and KPI counter both match correctly.
+            _PENDING_APPROVAL_VARIANTS = {
+                "PENDING", "PENDING_SETTLEMENT", "UNKNOWN", "MISSING",
+                "AWAITING_APPROVAL", "AWAITING APPROVAL",
+            }
+
+            if raw_erp_stat in _PENDING_APPROVAL_VARIANTS:
                 status = "PENDING_APPROVAL"
                 failure_reason = None
                 notes = f"Missing clearance status on ERP ledger. Settled in PayPal as {pp_id}."

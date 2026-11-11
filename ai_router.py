@@ -254,7 +254,7 @@ STRICT INTENT CLASSIFICATION RULES:
        - Set `target_table` to "silver_transactions" (or "silver_paypal_transactions" / "silver_erp_invoices").
        - Add a filter condition: `transaction_id` equals the transaction ID extracted from the query (or `internal_invoice_id` / `paypal_transaction_id` if ERP/PayPal prefix).
        - Automatically query the `failure_reason` and `notes` fields from the dataset.
-       - In `human_response`, provide a concise 1-sentence explanation acknowledging the root cause (e.g. 'Isolated settlement failure on TXN-010. I have filtered the main grid and generated a diagnostic summary table below.').
+       - In `human_response`, explicitly extract and state the exact financial or technical root cause (e.g., specifying if it's an unmatched settlement, FX variance limit breach, invalid receiver account, or missing ERP amount) in clear natural language alongside confirming the grid filter.
 
 3. FINANCIAL_QA:
    - If the user asks a general question about this project, our architecture, PayPal settlements, Four-Eyes validation, Medallion architecture (Bronze/Silver/Gold), double-entry bookkeeping, financial reconciliation, dashboard navigation, UI instructions, how to upload or sync data, and how to use the system:
@@ -307,7 +307,7 @@ ADDITIONAL RULES FOR DATA_QUERY:
 7. Default sort by most relevant column descending
 8. Default limit to 100 unless the user specifies otherwise
 9. When joining tables is needed, specify the required tables in join_tables
-10. For queries asking why a transaction failed (e.g. "Why did transaction [ID] fail?"), always target `silver_transactions`, filter by `transaction_id` eq [ID], query `failure_reason` and `notes`, and explain the exact technical root cause in plain English."""
+10. For queries asking why a transaction failed (e.g. "Why did transaction [ID] fail?"), always target `silver_transactions`, filter by `transaction_id` eq [ID], query `failure_reason` and `notes`, and explicitly state the exact financial or technical root cause (e.g. unmatched settlement, fee variance, invalid vendor account, or missing ERP amount) clearly in the conversational response."""
 
 
 def _classify_intent_heuristically(sanitised_query: str) -> Optional[CopilotInvestigationOutput]:
@@ -379,7 +379,7 @@ def _classify_intent_heuristically(sanitised_query: str) -> Optional[CopilotInve
                     value=target_txn_id,
                 )
             )
-            human_resp = f"Isolated settlement failure on {target_txn_id}. I have filtered the main grid and generated a diagnostic summary table below."
+            human_resp = f"Investigating root-cause failure on {target_txn_id}. Filtered grid to isolate diagnostic records and extract failure reason."
             explanation = f"Querying silver_transactions where transaction_id == '{target_txn_id}'."
         else:
             filters.append(
@@ -450,13 +450,22 @@ async def call_gemini_with_schema(
         f"{envelope.render_isolated()}"
     )
 
-    candidate_models = ["gemini-3.5-flash", "gemini-3.8-flash"]
+    # BUG 3 FIX: "gemini-3.5-flash" and "gemini-3.8-flash" are not valid Gemini
+    # model names and cause every AI request to fail silently, making the
+    # chatbot appear frozen.  The correct names are "gemini-2.5-flash" (primary)
+    # and "gemini-2.0-flash" (fallback).
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     response = None
     last_exc = None
 
     for m in candidate_models:
         try:
-            response = client.models.generate_content(
+            # BUG 3 FIX: The original call used the synchronous
+            # client.models.generate_content() inside an async function without
+            # await, which blocks the entire FastAPI event loop for the full
+            # LLM round-trip (~1–3 s) and causes the chatbot to appear frozen.
+            # Switch to the async variant client.aio.models.generate_content().
+            response = await client.aio.models.generate_content(
                 model=m,
                 contents=user_prompt,
                 config=genai_types.GenerateContentConfig(
@@ -1156,26 +1165,49 @@ async def investigate(
     row_json_dump: str = json.dumps(top_50_dicts, default=str)
 
     # Second call to Gemini LLM with exact RAG system prompt
+    query_lower = request.query.lower()
+    is_failure_investigation = any(
+        kw in query_lower for kw in ["why", "fail", "failed", "error", "root cause", "discrepan", "unmatch", "mismatch", "variance", "fx"]
+    )
+
     rag_system_prompt: str = (
-        f"The user asked: '{request.query}'. "
-        f"There are {len(top_50_dicts)} matching database records found. "
-        "Do NOT output raw data lists, verbose bullet points, or repetitive row-by-row field dumps because the frontend renders an interactive Generative UI data table widget automatically. "
-        "Return ONLY a very brief, punchy 1-sentence executive summary (e.g. 'I found 2 FX anomalies. I have filtered the main grid and generated a summary table below.')."
+        f"You are the AI Financial Copilot for Ask-Your-Payments, an enterprise FinOps reconciliation engine.\n"
+        f"The user asked: '{request.query}'. There are {len(top_50_dicts)} matching database records found.\n\n"
+        "STRICT RESPONSE INSTRUCTIONS:\n"
+        "1. EXPLICIT ROOT-CAUSE EXTRACTION: If the user asks why a transaction failed or inquires about a ledger discrepancy/anomaly:\n"
+        "   - You MUST read the `failure_reason`, `notes`, `erp_status`, and discrepancy columns directly from the provided database records.\n"
+        "   - Explicitly identify and state the exact financial or technical root cause (e.g. PayPal Sandbox API rejection / INVALID_RECEIVER_ACCOUNT, "
+        "FX variance limit breach, fee calculation mismatch, missing ERP amount, or unmatched settlement leg).\n"
+        "2. CLEAR NATURAL LANGUAGE OUTPUT: State this exact root cause clearly and directly in your conversational response sentence. "
+        "Do NOT give a generic summary like 'Isolated settlement failure'. Specifically state WHAT caused the failure and confirm that the grid has been filtered.\n"
+        "   - Example: 'Transaction TXN-010 failed due to a PayPal API execution error: INVALID_RECEIVER_ACCOUNT. I have filtered the main grid and isolated the record below.'\n"
+        "   - Example: 'Transaction TXN-005 failed due to an FX variance limit breach (Δ$50.00). I have filtered the grid to display the discrepancy details below.'\n"
+        "3. FORMAT: Limit the response to 1-2 punchy, professional sentences. Do NOT output raw data lists, verbose bullet points, or repetitive field dumps, "
+        "as the frontend renders an interactive Generative UI data table widget automatically."
     )
 
     client: genai.Client = _get_gemini_client()
     second_call_response: Optional[str] = None
 
-    candidate_rag_models = ["gemini-3.5-flash", "gemini-3.8-flash"]
+    # Pass the actual retrieved database records to Gemini for explicit root-cause synthesis
+    rag_user_contents: str = (
+        f"User question: '{request.query}'.\n\n"
+        f"Retrieved Records from Database ({len(top_50_dicts)} rows):\n"
+        f"{row_json_dump}\n\n"
+        "Provide a 1-2 sentence response. If this is a failure or discrepancy query, explicitly state the exact root cause identified from the records."
+    )
+
+    # BUG 3 FIX: Same invalid model names on the second (RAG summarisation) call.
+    candidate_rag_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     for rm in candidate_rag_models:
         try:
             gemini_rag_res = await client.aio.models.generate_content(
                 model=rm,
-                contents=f"User question: '{request.query}'. Provide a 1-sentence punchy summary acknowledging the filtered records.",
+                contents=rag_user_contents,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=rag_system_prompt,
                     temperature=0.1,
-                    max_output_tokens=150,
+                    max_output_tokens=250,
                 ),
             )
             if gemini_rag_res and gemini_rag_res.text and len(gemini_rag_res.text.strip()) >= 15:
@@ -1187,12 +1219,23 @@ async def investigate(
     if not second_call_response:
         # Fallback dynamic synthesis strictly from retrieved database records
         count = len(top_50_dicts)
-        query_lower = request.query.lower()
-        if "fx" in query_lower or "anomal" in query_lower:
-            second_call_response = f"I found {count} FX variance anomal{'y' if count == 1 else 'ies'}. I have filtered the main grid and generated a summary table below."
-        elif any(w in query_lower for w in ["why", "fail", "failed", "error", "root cause"]):
-            target_id = (top_50_dicts[0].get("transaction_id") or top_50_dicts[0].get("id")) if top_50_dicts else "TXN-010"
-            second_call_response = f"Isolated settlement failure on {target_id}. I have filtered the main grid and generated a diagnostic summary table below."
+        first_row = top_50_dicts[0] if top_50_dicts else {}
+        target_id = first_row.get("transaction_id") or first_row.get("id") or "TXN-010"
+        extracted_cause = (
+            first_row.get("failure_reason")
+            or first_row.get("notes")
+            or "an unmatched settlement discrepancy"
+        )
+        if "fx" in query_lower or "variance" in query_lower or "anomal" in query_lower:
+            second_call_response = (
+                f"I found {count} FX variance anomal{'y' if count == 1 else 'ies'}. "
+                f"Primary root cause: {extracted_cause}. I have filtered the main grid and generated a summary table below."
+            )
+        elif is_failure_investigation:
+            second_call_response = (
+                f"Transaction {target_id} failed due to: {extracted_cause}. "
+                f"I have filtered the main grid and isolated the diagnostic pipeline below."
+            )
         elif any(w in query_lower for w in ["four-eyes", "four eyes", "lock", "audit"]):
             second_call_response = f"Located {count} transaction(s) under Four-Eyes dual-custody hold. I have filtered the main grid and generated a summary table below."
         else:
@@ -1260,5 +1303,5 @@ async def ai_health() -> dict[str, str]:
     return {
         "status": "healthy",
         "service": "ai_investigation_router",
-        "model": "gemini-3.8-flash",
+        "model": "gemini-2.5-flash",
     }

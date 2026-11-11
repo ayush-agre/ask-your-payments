@@ -822,11 +822,18 @@ async def upload_csv_files(
     db: AsyncSession = Depends(get_session),
 ) -> Any:
     """
-    Simultaneously ingests both Side A (ERP) and Side B (PayPal) CSV streams.
-    - Persists raw CSV rows into the BronzeEvent table with SHA-256 payload hashes
-      and database-level deduplication (on_conflict_do_nothing on uq_bronze_source_dedup).
-    - Eliminates ephemeral in-memory storage buffers in favor of persistent Bronze events.
-    - Triggers deterministic reconciliation into the PostgreSQL Silver Transaction ledger.
+    Medallion Architecture — BRONZE LAYER ONLY ingestion.
+
+    Persists raw CSV rows into the BronzeEvent staging table with SHA-256 payload
+    hashes and database-level deduplication (on_conflict_do_nothing on
+    uq_bronze_source_dedup).  Returns a lightweight acknowledgement payload so
+    the frontend can display the raw staged rows.
+
+    IMPORTANT: This endpoint intentionally does NOT trigger the deterministic
+    matching engine.  Silver-layer reconciliation only happens when the user
+    explicitly clicks "Reconcile Now", which calls GET /api/v1/reconcile.
+    This preserves the Bronze -> Silver -> Gold medallion promotion flow and
+    prevents premature status assignment before the user initiates matching.
     """
     try:
         erp_rows: List[Dict[str, Any]] = []
@@ -916,12 +923,70 @@ async def upload_csv_files(
             await db.commit()
             logger.info("Persisted %d raw CSV records to BronzeEvent store with database deduplication.", len(bronze_entries_to_insert))
 
-        # Immediately after bronze ingestion, trigger deterministic matching engine
-        return await run_deterministic_matching(
-            db,
-            erp_rows=erp_rows if erp_rows else None,
-            paypal_rows=paypal_rows if paypal_rows else None,
+        # ── Build a lightweight Bronze acknowledgement payload ───────────
+        # Represent each raw row as a staged Bronze record so the frontend
+        # grid can show "RAW_INGESTED" rows immediately after upload without
+        # any Silver-layer status assignment.  The fields mirror the Silver
+        # Transaction schema so the same AG Grid column defs render them.
+        bronze_rows: List[Dict[str, Any]] = []
+        for entry in bronze_entries_to_insert:
+            try:
+                raw = json.loads(entry["raw_payload"])
+            except Exception:
+                raw = {}
+            txn_id = (
+                raw.get("erp_txn_id")
+                or raw.get("erp_reference_id")
+                or raw.get("transaction_id")
+                or raw.get("paypal_transaction_id")
+                or raw.get("internal_invoice_id")
+                or entry["source_event_id"]
+            )
+            bronze_rows.append({
+                "id": entry["source_event_id"],
+                "transaction_id": txn_id,
+                "timestamp": entry["ingested_at"].isoformat() if hasattr(entry["ingested_at"], "isoformat") else str(entry["ingested_at"]),
+                "vendor_email": raw.get("vendor_email") or raw.get("vendor_name") or raw.get("payer_email") or "N/A",
+                "amount": str(raw.get("amount") or raw.get("gross_amount") or raw.get("mc_gross") or raw.get("erp_amount") or "0.00"),
+                "currency": raw.get("currency") or raw.get("mc_currency") or "USD",
+                # RAW_INGESTED is the canonical Bronze-layer status.  It signals
+                # to the UI that this row has not been through the matching engine
+                # yet and must not be confused with PENDING (which is a Silver state).
+                "erp_status": "RAW_INGESTED",
+                "notes": f"Staged to Bronze layer from {entry['source']}. Click 'Reconcile Now' to promote to Silver.",
+                "failure_reason": None,
+                "proposer_email": None,
+                "approver_email": None,
+                "source": entry["source"],
+                "payload_hash": entry["payload_hash"],
+            })
+
+        logger.info(
+            "[BRONZE INGESTION] Staged %d raw records (ERP=%d, PayPal=%d). "
+            "Matching engine NOT triggered — awaiting explicit /reconcile call.",
+            len(bronze_rows),
+            len(erp_rows),
+            len(paypal_rows),
         )
+
+        return {
+            "status": "staged",
+            "layer": "bronze",
+            "message": (
+                f"Bronze ingestion complete: {len(erp_rows)} ERP + {len(paypal_rows)} PayPal records "
+                f"staged with SHA-256 deduplication. Click 'Reconcile Now' to run the deterministic "
+                f"matching engine and promote records to the Silver operational layer."
+            ),
+            "rows": bronze_rows,
+            "total": len(bronze_rows),
+            "lastRow": len(bronze_rows),
+            "summary": {
+                "erp_staged": len(erp_rows),
+                "paypal_staged": len(paypal_rows),
+                "total_staged": len(bronze_rows),
+                "reconciliation_pending": True,
+            },
+        }
     except Exception as exc:
         try:
             await db.rollback()
@@ -1275,6 +1340,7 @@ async def get_grid_rows(
 
     total_vol = Decimal("0.00")
     pending_count = 0
+    active_locks_count = 0   # FIX: count exact PENDING_APPROVAL rows for Four-Eyes Locks KPI
     dlq_count = 0
     settled_count = 0
     found_curr: Optional[str] = None
@@ -1288,7 +1354,13 @@ async def get_grid_rows(
             except Exception:
                 pass
             st = str(r_stat or "").upper()
-            if "PENDING" in st or "PROPOSED" in st or "REVIEW" in st:
+            # FIX: "PENDING_APPROVAL" is the canonical status for manager queue items.
+            # Count it separately for the Four-Eyes Locks KPI so the counter
+            # matches exactly what the Manager filter shows in the grid.
+            if st == "PENDING_APPROVAL":
+                pending_count += 1
+                active_locks_count += 1
+            elif "PENDING" in st or "PROPOSED" in st or "REVIEW" in st:
                 pending_count += 1
             elif "DLQ" in st or "FAIL" in st or "UNMATCHED" in st or "DISPUTE" in st:
                 dlq_count += 1
@@ -1304,7 +1376,11 @@ async def get_grid_rows(
             except Exception:
                 pass
             st = str(r.get("erp_status") or "").upper()
-            if "PENDING" in st or "PROPOSED" in st or "REVIEW" in st:
+            # FIX: Same exact-match logic applied to in-memory ledger fallback.
+            if st == "PENDING_APPROVAL":
+                pending_count += 1
+                active_locks_count += 1
+            elif "PENDING" in st or "PROPOSED" in st or "REVIEW" in st:
                 pending_count += 1
             elif "DLQ" in st or "FAIL" in st or "UNMATCHED" in st or "DISPUTE" in st:
                 dlq_count += 1
@@ -1317,7 +1393,9 @@ async def get_grid_rows(
         "totalVolume": f"{curr_sym}{total_vol.quantize(Decimal('0.01')):,.2f}",
         "currency": primary_curr,
         "pendingPayouts": pending_count,
-        "activeLocks": max(1, pending_count // 2) if pending_count > 0 else 0,
+        # FIX: activeLocks now counts EXACT "PENDING_APPROVAL" rows so it matches
+        # the Manager filter queue count in the AG Grid.  No artificial minimum of 1.
+        "activeLocks": active_locks_count,
         "dlqCount": dlq_count,
         "settledCount": settled_count,
     }

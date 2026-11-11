@@ -22,6 +22,7 @@ import {
   ICellRendererParams,
   ITooltipParams,
   ClientSideRowModelModule,
+  AllCommunityModule,
   IServerSideDatasource,
   IServerSideGetRowsParams,
   ValidationModule,
@@ -38,6 +39,7 @@ import {
 } from "ag-grid-community";
 import {
   LicenseManager,
+  AllEnterpriseModule,
   RowGroupingModule,
   RowGroupingPanelModule,
   CellSelectionModule,
@@ -49,9 +51,11 @@ import {
 import "ag-grid-community/styles/ag-grid.css";
 import "ag-grid-community/styles/ag-theme-alpine.css";
 
-// Register AG Grid Modules outside component render cycle
+// Register AG Grid Modules outside component render cycle (AG Grid v36 standard)
 ModuleRegistry.registerModules([
   ClientSideRowModelModule,
+  AllCommunityModule,
+  AllEnterpriseModule,
   ServerSideRowModelModule,
   ServerSideRowModelApiModule,
   ValidationModule,
@@ -265,7 +269,10 @@ const FailureReasonRenderer = (params: ICellRendererParams<FinancialGridRow>) =>
   const row = params.data;
   if (!row) return <span className="text-slate-600 font-mono text-xs">—</span>;
 
-  const status = (row.erp_status || "").toUpperCase();
+  // BUG 2 FIX (part A): Also check row.status as a fallback because the SSRM
+  // datasource sometimes serialises the status under the generic "status" key
+  // rather than the canonical "erp_status" key (e.g. in-memory ledger fallback).
+  const status = (row.erp_status || row.status || "").toUpperCase();
   const isFailed =
     status === "FAILED" ||
     status === "DLQ" ||
@@ -274,7 +281,11 @@ const FailureReasonRenderer = (params: ICellRendererParams<FinancialGridRow>) =>
     status === "REJECTED" ||
     status === "ERROR";
 
-  const reason = params.value || (isFailed ? row.notes : null);
+  // BUG 2 FIX (part B): Use nullish coalescing (??) instead of || so that an
+  // explicitly set empty-string failure_reason doesn't silently fall through.
+  // Also read row.failure_reason directly as a second source because params.value
+  // may be undefined when the column is not in the current view port cache.
+  const reason = params.value ?? row.failure_reason ?? (isFailed ? row.notes : null);
 
   if (isFailed || reason) {
     const displayText = reason || "INCIDENT FLAGGED";
@@ -487,59 +498,70 @@ export default function FinancialStudioCommandCenter() {
     dlqCount: 1,
   });
 
-  // Derived state: dynamic aggregation mapped strictly from normalized erp_status sent by backend
+  // Derived state: dynamic aggregation mapped strictly from normalized erp_status sent by backend.
+  // FIX: Groups rows into the 3 canonical status buckets that the backend produces.
+  // Any variant that maps to SETTLED/PENDING_APPROVAL/FAILED is coalesced into its
+  // canonical bucket so the BarChart never shows an extra "PENDING" axis label.
   const statusChartData = useMemo(() => {
-    const statusMap = new Map<string, { volume: number; count: number }>();
+    // ── Canonical bucket definitions ──────────────────────────────────────
+    type Bucket = { volume: number; count: number };
+    const SETTLED_KEY = "SETTLED";
+    const PENDING_KEY = "PENDING_APPROVAL";
+    const FAILED_KEY  = "FAILED";
+
+    const buckets: Record<string, Bucket> = {
+      [SETTLED_KEY]: { volume: 0, count: 0 },
+      [PENDING_KEY]: { volume: 0, count: 0 },
+      [FAILED_KEY]:  { volume: 0, count: 0 },
+    };
+
+    // Helper: map any erp_status string → one of the 3 canonical bucket keys.
+    const toCanonicalBucket = (rawStatus: string): string => {
+      const s = rawStatus.toUpperCase().trim();
+      // SETTLED variants
+      if (
+        s === "SETTLED" || s === "EXECUTED" || s === "MATCHED" ||
+        s === "PAID"    || s === "RECONCILED" || s === "SUCCESS" || s === "POSTED"
+      ) return SETTLED_KEY;
+      // FAILED variants
+      if (
+        s === "FAILED" || s === "DLQ"       || s === "UNMATCHED" ||
+        s === "DISPUTED"|| s === "REJECTED" || s === "ERROR"
+      ) return FAILED_KEY;
+      // PENDING_APPROVAL variants (everything else pending/review)
+      if (
+        s === "PENDING_APPROVAL" || s === "PENDING" ||
+        s === "PROPOSED"        || s === "REVIEW_REQUIRED" ||
+        s === "PROCESSING"      || s === "EXECUTING" || s === "PARTIAL"
+      ) return PENDING_KEY;
+      // Unrecognised → bucket as PENDING_APPROVAL (requires human attention)
+      return PENDING_KEY;
+    };
 
     rowData.forEach((row) => {
-      const rawStatus = (row.erp_status || "PENDING").toUpperCase().trim();
+      const bucket = toCanonicalBucket(row.erp_status || "PENDING");
+      // Strip currency symbols and commas before parsing the amount.
       const cleanAmt = String(row.amount || "0").replace(/[^0-9.-]/g, "");
       const val = parseFloat(cleanAmt) || 0;
 
-      const current = statusMap.get(rawStatus) || { volume: 0, count: 0 };
-      current.volume = Math.round((current.volume + val) * 100) / 100;
-      current.count += 1;
-      statusMap.set(rawStatus, current);
+      buckets[bucket].volume = Math.round((buckets[bucket].volume + val) * 100) / 100;
+      buckets[bucket].count  += 1;
     });
 
-    const preferredOrder = ["SETTLED", "PENDING_APPROVAL", "PENDING", "FAILED", "UNMATCHED"];
-    const presentKeys = Array.from(statusMap.keys());
-    const orderedKeys = Array.from(
-      new Set([...preferredOrder.filter((s) => statusMap.has(s)), ...presentKeys])
-    );
+    // Always emit all 3 buckets in a fixed order so the X-axis labels never shuffle.
+    return [SETTLED_KEY, PENDING_KEY, FAILED_KEY].map((name) => {
+      const data = buckets[name];
+      const isSettled = name === SETTLED_KEY;
+      const isFailed  = name === FAILED_KEY;
 
-    if (orderedKeys.length === 0) {
-      orderedKeys.push("SETTLED", "PENDING_APPROVAL", "FAILED");
-    }
-
-    return orderedKeys.map((name) => {
-      const data = statusMap.get(name) || { volume: 0, count: 0 };
-      const isSettled =
-        name.includes("SETTLE") ||
-        name.includes("EXECUTE") ||
-        name.includes("PAID") ||
-        name.includes("MATCH") ||
-        name.includes("SUCCESS");
-      const isFailed =
-        name.includes("FAIL") ||
-        name.includes("UNMATCH") ||
-        name.includes("DLQ") ||
-        name.includes("REJECT") ||
-        name.includes("DISPUTE") ||
-        name.includes("ERROR");
-
-      const fill = isSettled
-        ? "url(#settledGradient)"
-        : isFailed
-        ? "url(#failedGradient)"
-        : "url(#pendingGradient)";
+      const fill   = isSettled ? "url(#settledGradient)" : isFailed ? "url(#failedGradient)" : "url(#pendingGradient)";
       const stroke = isSettled ? "#22c55e" : isFailed ? "#ef4444" : "#eab308";
 
       return {
         name,
-        volume: data.volume,
-        value: data.volume,
-        count: data.count,
+        volume:   data.volume,   // FIX: volume=0 renders as an empty bar (no minPointSize)
+        value:    data.volume,
+        count:    data.count,
         currency: activeCurrency,
         fill,
         stroke,
@@ -579,7 +601,7 @@ export default function FinancialStudioCommandCenter() {
       content: "Connected to PostgreSQL Medallion Store (Silver/Gold layers). Root-cause failure inspection engine active. Ask 'Why did transaction [ID] fail?' to diagnose any discrepancies.",
       payload: {
         engine: "Ask-Your-Payments Execution Sentinel",
-        llm_model: "gemini-3.8-flash",
+        llm_model: "gemini-2.5-flash",
         schema_contract: "InvestigationIntent",
         diagnostic_mode: "Explicit Root-Cause Failure Reasoning",
         driver: "asyncpg + pg_trgm",
@@ -641,6 +663,12 @@ export default function FinancialStudioCommandCenter() {
             const s = (r.erp_status || "").toUpperCase();
             return s.includes("PENDING") || s.includes("PROPOSED") || s.includes("REVIEW");
           }).length;
+          // FIX: activeLocks counts EXACT "PENDING_APPROVAL" rows so it matches the
+          // Manager filter queue.  Previously used Math.max(1, floor(pending/2))
+          // which forced a minimum of 1 even when no locks exist.
+          const activeLocks = mapped.filter((r) =>
+            (r.erp_status || "").toUpperCase() === "PENDING_APPROVAL"
+          ).length;
           const dlq = mapped.filter((r) => {
             const s = (r.erp_status || "").toUpperCase();
             return s.includes("DLQ") || s.includes("FAIL") || s.includes("UNMATCHED") || s.includes("DISPUTE");
@@ -649,7 +677,7 @@ export default function FinancialStudioCommandCenter() {
           setMetrics({
             totalVolume: new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(total),
             pendingPayouts: pending,
-            activeLocks: Math.max(1, Math.floor(pending / 2)),
+            activeLocks,
             dlqCount: dlq,
           });
         }
@@ -838,7 +866,11 @@ export default function FinancialStudioCommandCenter() {
 
       setRowData(mapped);
 
+      // BUG 1 FIX: Force SSRM to discard its cache and re-fetch from the
+      // datasource so the grid reflects reconciled rows immediately without
+      // requiring a manual page reload.
       if (gridApi) {
+        (gridApi as any).refreshServerSide?.({ purge: true });
         gridApi.refreshCells();
       }
 
@@ -854,11 +886,17 @@ export default function FinancialStudioCommandCenter() {
         const s = (r.erp_status || "").toUpperCase();
         return s.includes("DLQ") || s.includes("FAIL") || s.includes("UNMATCHED") || s.includes("DISPUTE");
       }).length;
+      // FIX: activeLocks counts EXACT "PENDING_APPROVAL" rows so it matches the
+      // Manager filter queue.  Previously used Math.max(1, floor(pending/2))
+      // which forced a minimum of 1 even when no locks exist.
+      const activeLocks = mapped.filter((r) =>
+        (r.erp_status || "").toUpperCase() === "PENDING_APPROVAL"
+      ).length;
 
       setMetrics({
         totalVolume: new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(total),
         pendingPayouts: pending,
-        activeLocks: Math.max(1, Math.floor(pending / 2)),
+        activeLocks,
         dlqCount: dlq,
       });
 
@@ -916,26 +954,31 @@ export default function FinancialStudioCommandCenter() {
       const result = await response.json();
       const rows: any[] = result.rows || [];
 
-      // Unify and map returned records directly to AG Grid & Recharts
+      // Map Bronze staging records into the grid row shape.
+      // erp_status will be "RAW_INGESTED" from the backend — this is intentional:
+      // the matching engine has NOT run yet.  The grid shows raw staged rows so
+      // the user can verify the upload before explicitly clicking "Reconcile Now".
       const mapped: FinancialGridRow[] = rows.map((r: any, idx: number) => ({
-        id: r.id || r.transaction_id || `recon-${idx}`,
+        id: r.id || r.transaction_id || `bronze-${idx}`,
         transaction_id: r.transaction_id || `TXN-${idx + 1}`,
         timestamp: r.timestamp || new Date().toISOString(),
         vendor_email: r.vendor_email || "N/A",
         amount: String(r.amount || "0.00"),
         currency: r.currency || "USD",
-        erp_status: r.erp_status || "PENDING",
-        notes: r.notes || "—",
-        failure_reason: r.failure_reason || (r.erp_status === "FAILED" ? r.notes : null),
-        proposer_email: r.proposer_email,
-        approver_email: r.approver_email,
+        // Preserve RAW_INGESTED — do NOT default to "PENDING" here because that
+        // would falsely imply the Silver matching engine has already classified it.
+        erp_status: r.erp_status || "RAW_INGESTED",
+        notes: r.notes || "Awaiting reconciliation",
+        failure_reason: null,
+        proposer_email: r.proposer_email ?? null,
+        approver_email: r.approver_email ?? null,
       }));
 
       setRowData(mapped);
       setIsDataIngested(true);
       setIngestedCount(mapped.length);
 
-      // Trigger grid refresh upon receiving 200 OK
+      // Refresh the SSRM grid so Bronze rows appear immediately
       await fetchGridData();
       if (gridApi) {
         (gridApi as any).refreshServerSide?.({ purge: true });
@@ -943,7 +986,7 @@ export default function FinancialStudioCommandCenter() {
       }
 
       const fileNames = Array.from(files).map((f) => f.name).join(", ");
-      setUploadFlash(`INGESTED (${mapped.length})`);
+      setUploadFlash(`STAGED (${mapped.length})`);
       setTimeout(() => setUploadFlash(null), 4000);
 
       setCopilotHistory((prev) => [
@@ -952,7 +995,7 @@ export default function FinancialStudioCommandCenter() {
           id: `csv-${Date.now()}`,
           timestamp: new Date().toISOString(),
           role: "system",
-          content: `[INGESTION & RECONCILIATION COMPLETE] Successfully ingested '${fileNames}'. Deterministic matching engine unified ${mapped.length} records into Silver layer.`,
+          content: `[BRONZE INGESTION COMPLETE] Staged ${mapped.length} raw records from '${fileNames}' to Bronze layer with SHA-256 deduplication. Status: RAW_INGESTED. Click 'Reconcile Now' to run the deterministic matching engine and promote records to the Silver operational layer.`,
         },
       ]);
     } catch (err: any) {
@@ -981,6 +1024,13 @@ export default function FinancialStudioCommandCenter() {
   // The 'Maker' Flow (Junior Analyst: Propose Override)
   const handleProposeOverride = async () => {
     if (!selectedRow || isOverriding) return;
+
+    // RBAC Layer 1: Role guard — only Maker (Junior Analyst) may propose overrides.
+    // Handler-level enforcement backs up the render-level ternary for defense-in-depth.
+    if (activeRole !== 'analyst') {
+      console.warn('[RBAC Enforcement] VIOLATION: Only Junior Analyst (Maker) role can propose overrides. Current role:', activeRole);
+      return;
+    }
 
     // Strict State Transition Enforcement: Analyst can ONLY act on unapproved/failed rows, NOT PENDING_APPROVAL or SETTLED
     const currentStatus = (selectedRow.erp_status || selectedRow.status || "").toUpperCase();
@@ -1109,14 +1159,21 @@ export default function FinancialStudioCommandCenter() {
   const handleApproveAndExecute = async () => {
     if (!selectedRow || isOverriding) return;
 
+    // Strict Maker-Checker RBAC Identity Enforcement:
+    // When role is Junior Analyst (Maker), approver identity matches proposer ("analyst@finops.corp"),
+    // strictly triggering the backend 403 Forbidden dual-custody check (approver != proposer).
+    // When role is Senior Manager (Checker), approver identity is "manager@finops.corp".
+    const proposer = selectedRow.proposer_email || "analyst@finops.corp";
+    const approver = activeRole === "analyst" ? proposer : "manager@finops.corp";
+
     // Strict State Transition Enforcement: Manager button ONLY accepts rows that are PENDING_APPROVAL
     const currentStatus = (selectedRow.erp_status || selectedRow.status || "").toUpperCase();
     if (currentStatus !== "PENDING_APPROVAL") {
       console.warn("[RBAC Enforcement] Manager can ONLY accept and execute rows with PENDING_APPROVAL status.");
       setFourEyesError({
         message: "Invalid state transition: Manager can ONLY approve rows in PENDING_APPROVAL status.",
-        proposer: selectedRow.proposer_email || "N/A",
-        approver: "manager@finops.corp",
+        proposer: proposer,
+        approver: approver,
         transaction_id: selectedRow.transaction_id || selectedRow.id || "N/A",
       });
       return;
@@ -1125,8 +1182,6 @@ export default function FinancialStudioCommandCenter() {
     const targetTxnId = selectedRow.transaction_id || selectedRow.operation_id || selectedRow.id;
     if (!targetTxnId) return;
 
-    const approver = "manager@finops.corp";
-    const proposer = selectedRow.proposer_email || "analyst@finops.corp";
     const prevStatus = selectedRow.erp_status || selectedRow.status || "PENDING_APPROVAL";
     const prevFailureReason = selectedRow.failure_reason;
     const prevNotes = selectedRow.notes;
@@ -1279,6 +1334,12 @@ export default function FinancialStudioCommandCenter() {
   // The 'Checker' Rejection Flow (Senior Manager: Reject Proposal)
   const handleRejectProposal = async () => {
     if (!selectedRow || isOverriding || isRejecting) return;
+
+    // RBAC Layer: Only Senior Manager (Checker) may reject proposals.
+    if (activeRole !== "manager") {
+      console.warn("[RBAC Enforcement] VIOLATION: Only Senior Manager (Checker) role can reject proposals. Current role:", activeRole);
+      return;
+    }
 
     // Strict State Transition Enforcement: Manager button ONLY accepts rows that are PENDING_APPROVAL
     const currentStatus = (selectedRow.erp_status || selectedRow.status || "").toUpperCase();
@@ -1659,9 +1720,22 @@ export default function FinancialStudioCommandCenter() {
         dlqCount: 0,
       });
 
-      // 3. AG Grid refresh
+      // 3. AG Grid aggressive visual clear — three-call sequence to handle
+      //    all AG Grid Enterprise SSRM versions:
+      //    a) setGridOption('rowData', []) — immediately paints 0 rows in
+      //       Client-Side mode and clears any rowData override in SSRM.
+      //    b) purgeServerSideCache() — legacy API (AG Grid <v30) that nukes
+      //       every block the SSRM has cached, forcing a full re-fetch.
+      //    c) refreshServerSide({ purge: true }) — modern API (AG Grid ≥v30)
+      //       equivalent: discards all cached blocks and re-queries the
+      //       datasource, which now returns 0 rows from the wiped backend.
+      //    Both (b) and (c) are guarded with optional-chaining so the call
+      //    is silently skipped on whichever version doesn't support it.
       if (gridApi) {
-        gridApi.refreshCells();
+        gridApi.setGridOption("rowData", []);
+        (gridApi as any).purgeServerSideCache?.();
+        // fallback for newer ag-grid versions:
+        (gridApi as any).refreshServerSide?.({ purge: true });
       }
 
       // Log purge to audit stream
@@ -1732,12 +1806,17 @@ export default function FinancialStudioCommandCenter() {
           const s = (r.erp_status || "").toUpperCase();
           return s.includes("DLQ") || s.includes("FAIL") || s.includes("UNMATCHED") || s.includes("DISPUTE");
         }).length;
+        // FIX: activeLocks counts EXACT "PENDING_APPROVAL" rows so it matches the
+        // Manager filter queue.
+        const activeLocks = nextRows.filter((r) =>
+          (r.erp_status || "").toUpperCase() === "PENDING_APPROVAL"
+        ).length;
 
         const detectedCurr = nextRows.find((r) => r.currency)?.currency || "USD";
         setMetrics({
           totalVolume: new Intl.NumberFormat("en-US", { style: "currency", currency: detectedCurr }).format(total),
           pendingPayouts: pending,
-          activeLocks: Math.max(0, Math.floor(pending / 2)),
+          activeLocks,
           dlqCount: dlq,
         });
 
@@ -3186,6 +3265,7 @@ export default function FinancialStudioCommandCenter() {
                       name={`Volume (${activeCurrency})`}
                       radius={[8, 8, 0, 0]}
                       filter="url(#terminalBarGlow)"
+                      minPointSize={0}  // FIX: volume=0 must render as empty space, not a full-height bar
                     >
                       {statusChartData.map((entry, index) => (
                         <Cell
@@ -3439,7 +3519,7 @@ export default function FinancialStudioCommandCenter() {
                           </button>
                         )}
 
-                        {/* Conditional RBAC Action Button inside Inspector Drawer */}
+                        {/* Strict RBAC Action Button Segregation inside Inspector Drawer */}
                         {activeRole === "analyst" ? (
                           <button
                             onClick={handleProposeOverride}
@@ -3461,9 +3541,9 @@ export default function FinancialStudioCommandCenter() {
                               <span>PROPOSE OVERRIDE</span>
                             )}
                           </button>
-                        ) : (
+                        ) : activeRole === "manager" ? (
                           <div className="flex items-center gap-2">
-                            {/* Button 1 (Existing): Green APPROVE & EXECUTE */}
+                            {/* Button 1: Green APPROVE & EXECUTE */}
                             <button
                               onClick={handleApproveAndExecute}
                               disabled={isOverriding || isRejecting || !isPending || isSettled}
@@ -3496,7 +3576,7 @@ export default function FinancialStudioCommandCenter() {
                               )}
                             </button>
 
-                            {/* Button 2 (New): Red REJECT PROPOSAL */}
+                            {/* Button 2: Red REJECT PROPOSAL */}
                             <button
                               onClick={handleRejectProposal}
                               disabled={isOverriding || isRejecting || !isPending || isSettled}
@@ -3524,8 +3604,49 @@ export default function FinancialStudioCommandCenter() {
                                 <span>REJECT PROPOSAL</span>
                               )}
                             </button>
+
+                            {/* Button 3: Cyan — 🔍 Ask Copilot: Why Failed?
+                                Always enabled for Manager so they can query
+                                any transaction regardless of status.
+                                Pushes a user message into copilotHistory and
+                                fires POST /api/v1/investigate/ via
+                                handleAskCopilotDirect. The useEffect on
+                                copilotHistory auto-scrolls messagesEndRef. */}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const txnId =
+                                  selectedRow.transaction_id ||
+                                  selectedRow.id ||
+                                  "UNKNOWN";
+                                handleAskCopilotDirect(
+                                  `Why did transaction ${txnId} fail?`
+                                );
+                              }}
+                              disabled={isQuerying}
+                              className={`flex-none px-3.5 py-1.5 border text-[11px] font-mono uppercase tracking-wider font-bold transition-all flex items-center gap-1.5 ${
+                                isQuerying
+                                  ? "bg-cyan-950/40 text-cyan-600 border-cyan-900/50 opacity-50 cursor-not-allowed"
+                                  : "bg-cyan-950/70 hover:bg-cyan-900/80 text-cyan-300 hover:text-cyan-100 border-cyan-700/70 hover:border-cyan-500 shadow-[0_0_12px_rgba(34,211,238,0.15)] hover:shadow-[0_0_16px_rgba(34,211,238,0.35)] cursor-pointer"
+                              }`}
+                              title={`Ask Gemini 2.5 Flash to diagnose root-cause for ${
+                                selectedRow.transaction_id || selectedRow.id
+                              }`}
+                            >
+                              {isQuerying ? (
+                                <>
+                                  <span className="w-1.5 h-1.5 rounded-full bg-cyan-500 animate-ping flex-none" />
+                                  <span>COPILOT REASONING...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <span>🔍</span>
+                                  <span>ASK COPILOT: WHY FAILED?</span>
+                                </>
+                              )}
+                            </button>
                           </div>
-                        )}
+                        ) : null}
                       </div>
                     </div>
 
@@ -3603,91 +3724,16 @@ export default function FinancialStudioCommandCenter() {
               {selectedRow ? (
                 <>
                   {/* Conditional Button Rendering (RBAC Enforcement): Static demo buttons removed */}
+                  {/* Outbox status read-out — action buttons live in the
+                      Inspector Drawer above (Panel A) to avoid duplication. */}
                   {activeRole === "analyst" ? (
-                    <button
-                      onClick={handleProposeOverride}
-                      disabled={isOverriding || isRejecting || selectedRow.erp_status === "EXECUTING" || selectedRow.erp_status === "SETTLED" || selectedRow.erp_status === "PENDING_APPROVAL"}
-                      className="px-3 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500 disabled:opacity-40 disabled:cursor-not-allowed text-[10px] font-mono uppercase font-bold tracking-wider rounded-none transition-all flex items-center gap-1.5 shadow-[0_0_10px_rgba(245,158,11,0.2)] cursor-pointer"
-                      title="Propose override as Junior Analyst (Maker flow)"
-                    >
-                      {selectedRow.erp_status === "PENDING_APPROVAL" ? (
-                        <span>⏳ PROPOSAL STAGED</span>
-                      ) : (
-                        <span>PROPOSE OVERRIDE</span>
-                      )}
-                    </button>
+                    <span className="text-[10px] font-mono text-amber-400/80 uppercase tracking-wider">
+                      MAKER // PROPOSE OVERRIDE ↑
+                    </span>
                   ) : (
-                    <div className="flex items-center gap-2">
-                      {/* Button 1 (Existing): Green APPROVE & EXECUTE */}
-                      <button
-                        onClick={handleApproveAndExecute}
-                        disabled={
-                          isOverriding ||
-                          isRejecting ||
-                          selectedRow.erp_status === "EXECUTING" ||
-                          selectedRow.erp_status !== "PENDING_APPROVAL"
-                        }
-                        className={`px-3 py-1 text-[10px] font-mono uppercase font-bold tracking-wider rounded-none transition-all flex items-center gap-1.5 ${
-                          selectedRow.erp_status === "PENDING_APPROVAL" && !isOverriding && !isRejecting
-                            ? "bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.3)] cursor-pointer"
-                            : selectedRow.erp_status === "SETTLED"
-                            ? "bg-emerald-950/60 text-emerald-400 border border-emerald-800 opacity-60 cursor-not-allowed"
-                            : "bg-slate-800 text-slate-500 border border-slate-700 opacity-40 cursor-not-allowed"
-                        }`}
-                        title={
-                          selectedRow.erp_status === "PENDING_APPROVAL"
-                            ? "Approve & execute override as Senior Manager (Checker flow)"
-                            : selectedRow.erp_status === "SETTLED"
-                            ? "Transaction already settled."
-                            : "Strict RBAC: Manager can ONLY accept rows in PENDING_APPROVAL status."
-                        }
-                      >
-                        {isOverriding && selectedRow.erp_status === "EXECUTING" ? (
-                          <>
-                            <span className="w-1.5 h-1.5 bg-white animate-ping" />
-                            <span>DISPATCHING OUTBOX...</span>
-                          </>
-                        ) : selectedRow.erp_status === "SETTLED" ? (
-                          <span>✓ SETTLED</span>
-                        ) : selectedRow.erp_status === "PENDING_APPROVAL" ? (
-                          <span>APPROVE & EXECUTE</span>
-                        ) : (
-                          <span>AWAITING MAKER PROPOSAL</span>
-                        )}
-                      </button>
-
-                      {/* Button 2 (New): Red REJECT PROPOSAL */}
-                      <button
-                        onClick={handleRejectProposal}
-                        disabled={
-                          isOverriding ||
-                          isRejecting ||
-                          selectedRow.erp_status === "EXECUTING" ||
-                          selectedRow.erp_status !== "PENDING_APPROVAL"
-                        }
-                        className={`px-3 py-1 text-[10px] font-mono uppercase font-bold tracking-wider rounded-none transition-all flex items-center gap-1.5 ${
-                          selectedRow.erp_status === "PENDING_APPROVAL" && !isOverriding && !isRejecting
-                            ? "bg-rose-700 hover:bg-rose-600 text-white border border-rose-400 shadow-[0_0_10px_rgba(244,63,94,0.3)] cursor-pointer"
-                            : selectedRow.erp_status === "SETTLED"
-                            ? "bg-rose-950/40 text-rose-500 border border-rose-900/60 opacity-40 cursor-not-allowed"
-                            : "bg-slate-800 text-slate-500 border border-slate-700 opacity-40 cursor-not-allowed"
-                        }`}
-                        title={
-                          selectedRow.erp_status === "PENDING_APPROVAL"
-                            ? "Reject proposal and cancel outbox staging as Senior Manager"
-                            : "Strict RBAC: Rejection only applicable to rows in PENDING_APPROVAL status."
-                        }
-                      >
-                        {isRejecting ? (
-                          <>
-                            <span className="w-1.5 h-1.5 bg-white animate-ping" />
-                            <span>REJECTING...</span>
-                          </>
-                        ) : (
-                          <span>REJECT PROPOSAL</span>
-                        )}
-                      </button>
-                    </div>
+                    <span className="text-[10px] font-mono text-emerald-400/80 uppercase tracking-wider">
+                      CHECKER // USE CONTROLS ↑
+                    </span>
                   )}
                 </>
               ) : (
@@ -3711,7 +3757,7 @@ export default function FinancialStudioCommandCenter() {
                 AI RECON COPILOT // TERMINAL
               </span>
             </div>
-            <span className="text-[10px] text-slate-500 font-mono">GEMINI-3.8-FLASH</span>
+            <span className="text-[10px] text-slate-500 font-mono">GEMINI-2.5-FLASH</span>
           </div>
 
           {/* Copilot Message Stream */}
