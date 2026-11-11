@@ -1,0 +1,1846 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Ask-Your-Payments Consolidated Platform API",
+    "description": "Consolidated OpenAPI 3.1.0 specification for Ask-Your-Payments, merging the FastAPI core reconciliation backend (AI investigation, AG Grid SSRM datasource, Webhook ACK, Staged Operations) with the Mock Enterprise ERP API (Invoices, Vendors, General Ledger Journal Entries).",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Team CrackerX",
+      "email": "crackerx@askyourpayments.example.com"
+    },
+    "license": {
+      "name": "Apache 2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000",
+      "description": "Local FastAPI Core Backend"
+    },
+    {
+      "url": "https://erp-mock.askyourpayments.example.com",
+      "description": "Mock ERP Server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Invoices",
+      "description": "Accounts payable invoice operations"
+    },
+    {
+      "name": "Vendors",
+      "description": "Vendor master data operations"
+    },
+    {
+      "name": "Journal Entries",
+      "description": "General ledger posting operations"
+    },
+    {
+      "name": "AI Investigation",
+      "description": "Natural Language Investigation router powered by Gemini 2.5 Flash"
+    },
+    {
+      "name": "Financial Studio Grid",
+      "description": "AG Grid Enterprise Server-Side Row Model (SSRM) & Audit Evidence"
+    },
+    {
+      "name": "Webhooks",
+      "description": "Real-time PayPal Webhook ingestion & WebSocket broadcast"
+    },
+    {
+      "name": "System",
+      "description": "Liveness & Readiness health check probes"
+    }
+  ],
+  "paths": {
+    "/api/v1/investigate/": {
+      "post": {
+        "tags": [
+          "AI Investigation"
+        ],
+        "summary": "Natural Language Financial Investigation",
+        "description": "Accepts a natural language query from a FinOps manager, applies PII minimisation, sends the sanitised query to Gemini 2.5 Flash for intent extraction, and compiles the result into allowlisted parameterised SQL against the Silver/Gold operational records.",
+        "operationId": "investigate_api_v1_investigate__post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvestigationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvestigationResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "AI produced invalid schema or query is malformed"
+          },
+          "502": {
+            "description": "Gemini API unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/investigate/health": {
+      "get": {
+        "tags": [
+          "AI Investigation"
+        ],
+        "summary": "AI Router Health Check",
+        "description": "Verify the AI investigation router is operational.",
+        "operationId": "ai_health_api_v1_investigate_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Ai Health Api V1 Investigate Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/webhook/paypal": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "PayPal Webhook Ingestion & Real-Time Broadcast",
+        "description": "Simulates receiving a PayPal webhook:\n  1. Dedupes and records event into BronzeEvent table.\n  2. Locates matching Gold reconciliation record by paypal_transaction_id or reference_invoice_id.\n  3. Updates match_status to 'matched'.\n  4. Broadcasts a 'WEBHOOK_ACK' event to all connected AG Grid WebSockets\n     for instant, frame-safe row flashing and status update.",
+        "operationId": "paypal_webhook_handler_webhook_paypal_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PayPalWebhookPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Paypal Webhook Handler Webhook Paypal Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/grid/rows": {
+      "post": {
+        "tags": [
+          "Financial Studio Grid"
+        ],
+        "summary": "AG Grid Enterprise Server-Side Row Model (SSRM) Datasource",
+        "description": "Serves row data directly to AG Grid Server-Side Row Model (SSRM).\nSupports pagination, multi-column sorting, and joins Gold reconciliation\nmatches with Silver PayPal settlements and Silver ERP invoices.",
+        "operationId": "get_grid_rows_api_v1_grid_rows_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SSRMRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Grid Rows Api V1 Grid Rows Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/evidence/{match_id}": {
+      "get": {
+        "tags": [
+          "Financial Studio Grid"
+        ],
+        "summary": "Master-Detail Lazy-Loaded Reconciliation Evidence",
+        "description": "Lazy-loads full audit evidence when a FinOps manager expands a row.\nReturns ERP Invoice vs. PayPal settlement comparison, anomaly flags,\nand associated double-entry journal lines.",
+        "operationId": "get_evidence_detail_api_v1_evidence__match_id__get",
+        "parameters": [
+          {
+            "name": "match_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Match Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Evidence Detail Api V1 Evidence  Match Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/matches/{match_id}/override": {
+      "patch": {
+        "tags": [
+          "Financial Studio Grid"
+        ],
+        "summary": "FinOps Controller Override (Four-Eyes Flow)",
+        "description": "Processes manual FinOps controller overrides inside an AG Grid cell.\nStages an operation subject to Four-Eyes human verification and broadcasts\nthe updated match status to all connected WebSockets.",
+        "operationId": "override_match_api_v1_matches__match_id__override_patch",
+        "parameters": [
+          {
+            "name": "match_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Match Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OverrideRequestPayload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Override Match Api V1 Matches  Match Id  Override Patch"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Liveness & Readiness Probe",
+        "description": "Health check for deployment load balancers and orchestrators.",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Health Check Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Liveness & Readiness Probe",
+        "description": "Health check for deployment load balancers and orchestrators.",
+        "operationId": "health_check_healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Health Check Healthz Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/invoices": {
+      "get": {
+        "tags": [
+          "Invoices"
+        ],
+        "summary": "List accounts payable invoices",
+        "description": "Returns a paginated list of AP invoices, optionally filtered by status, vendor, or date range.",
+        "operationId": "listInvoices",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter invoices by status.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/InvoiceStatus"
+            }
+          },
+          {
+            "name": "vendor_id",
+            "in": "query",
+            "description": "Filter invoices by vendor identifier.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "example": "VND-100234"
+            }
+          },
+          {
+            "name": "from_date",
+            "in": "query",
+            "description": "Return invoices dated on or after this date (YYYY-MM-DD).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "example": "2026-10-01"
+            }
+          },
+          {
+            "name": "to_date",
+            "in": "query",
+            "description": "Return invoices dated on or before this date (YYYY-MM-DD).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "example": "2026-10-31"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "1-based page number.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Number of records per page.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A paginated list of invoices.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvoiceListResponse"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "internal_invoice_id": "INV-2026-0001",
+                      "vendor_id": "VND-100001",
+                      "vendor_name": "Tata Consultancy Services Ltd",
+                      "vendor_email": "accounts@tcs.com",
+                      "invoice_date": "2026-10-01",
+                      "due_date": "2026-10-31",
+                      "erp_amount": 485000.0,
+                      "currency": "INR",
+                      "status": "PAID"
+                    }
+                  ],
+                  "pagination": {
+                    "page": 1,
+                    "page_size": 25,
+                    "total_records": 15,
+                    "total_pages": 1
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/vendors": {
+      "get": {
+        "tags": [
+          "Vendors"
+        ],
+        "summary": "List vendors",
+        "description": "Returns a paginated list of vendors from the ERP vendor master.",
+        "operationId": "listVendors",
+        "parameters": [
+          {
+            "name": "active",
+            "in": "query",
+            "description": "Filter vendors by active flag.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "description": "Case-insensitive partial match on vendor name.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 100,
+              "example": "Tata"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "1-based page number.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Number of records per page.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A paginated list of vendors.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VendorListResponse"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "vendor_id": "VND-100001",
+                      "vendor_name": "Tata Consultancy Services Ltd",
+                      "vendor_email": "accounts@tcs.com",
+                      "gstin": "27AAACT2727Q1ZV",
+                      "pan": "AAACT2727Q",
+                      "payment_terms_days": 30,
+                      "default_currency": "INR",
+                      "active": true
+                    }
+                  ],
+                  "pagination": {
+                    "page": 1,
+                    "page_size": 25,
+                    "total_records": 15,
+                    "total_pages": 1
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/journal-entries": {
+      "post": {
+        "tags": [
+          "Journal Entries"
+        ],
+        "summary": "Post a journal entry",
+        "description": "Creates a balanced general ledger journal entry, for example to record a reconciled PayPal settlement, processing fee, or FX variance adjustment. Total debits must equal total credits.",
+        "operationId": "createJournalEntry",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Unique key to safely retry the request without creating duplicate entries.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "example": "recon-INV-2026-0013-20261019"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JournalEntryRequest"
+              },
+              "example": {
+                "posting_date": "2026-10-19",
+                "reference_invoice_id": "INV-2026-0013",
+                "paypal_transaction_id": "7HS40927NB358164C",
+                "description": "FX drift variance adjustment for INV-2026-0013",
+                "currency": "INR",
+                "lines": [
+                  {
+                    "account_code": "5900-FX-VARIANCE",
+                    "account_name": "FX Variance Expense",
+                    "debit": 25.0,
+                    "credit": 0.0,
+                    "memo": "Settlement short by INR 25.00"
+                  },
+                  {
+                    "account_code": "2100-AP-TRADE",
+                    "account_name": "Accounts Payable - Trade",
+                    "debit": 0.0,
+                    "credit": 25.0,
+                    "memo": "Clear residual AP balance"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Journal entry created successfully.",
+            "headers": {
+              "Location": {
+                "description": "URI of the created journal entry.",
+                "schema": {
+                  "type": "string",
+                  "example": "/api/journal-entries/JE-2026-000451"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JournalEntryResponse"
+                },
+                "example": {
+                  "journal_entry_id": "JE-2026-000451",
+                  "status": "POSTED",
+                  "posting_date": "2026-10-19",
+                  "reference_invoice_id": "INV-2026-0013",
+                  "paypal_transaction_id": "7HS40927NB358164C",
+                  "description": "FX drift variance adjustment for INV-2026-0013",
+                  "currency": "INR",
+                  "total_debit": 25.0,
+                  "total_credit": 25.0,
+                  "lines": [
+                    {
+                      "account_code": "5900-FX-VARIANCE",
+                      "account_name": "FX Variance Expense",
+                      "debit": 25.0,
+                      "credit": 0.0,
+                      "memo": "Settlement short by INR 25.00"
+                    },
+                    {
+                      "account_code": "2100-AP-TRADE",
+                      "account_name": "Accounts Payable - Trade",
+                      "debit": 0.0,
+                      "credit": 25.0,
+                      "memo": "Clear residual AP balance"
+                    }
+                  ],
+                  "created_at": "2026-10-19T09:42:17Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Conflict. A journal entry with the same Idempotency-Key already exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "code": "DUPLICATE_JOURNAL_ENTRY",
+                  "message": "A journal entry with this Idempotency-Key has already been posted.",
+                  "request_id": "req-8f31c2a7",
+                  "details": []
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable entity. The entry is syntactically valid but violates accounting rules, such as unbalanced debits and credits.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "code": "UNBALANCED_ENTRY",
+                  "message": "Total debits must equal total credits.",
+                  "request_id": "req-1b72e9d4",
+                  "details": [
+                    {
+                      "field": "lines",
+                      "issue": "Total debit 25.00 does not equal total credit 20.00"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AggregateFunction": {
+        "type": "string",
+        "enum": [
+          "count",
+          "sum",
+          "avg",
+          "min",
+          "max"
+        ],
+        "title": "AggregateFunction",
+        "description": "Allowlisted aggregate functions."
+      },
+      "AllowlistedColumn": {
+        "type": "string",
+        "enum": [
+          "paypal_transaction_id",
+          "reference_invoice_id",
+          "settled_amount",
+          "fee_amount",
+          "currency",
+          "transaction_timestamp",
+          "record_type",
+          "internal_invoice_id",
+          "vendor_name",
+          "vendor_email",
+          "erp_amount",
+          "erp_status",
+          "erp_status_normalised",
+          "match_method",
+          "match_status",
+          "confidence_score",
+          "variance_amount",
+          "variance_category",
+          "matched_at",
+          "rule_code",
+          "severity",
+          "suggested_action",
+          "detected_at",
+          "status",
+          "account_code",
+          "entry_type",
+          "amount"
+        ],
+        "title": "AllowlistedColumn",
+        "description": "Exhaustive whitelist of columns the LLM may reference in filters, sorts,\nand groupings. Maps to the AG Grid Column Whitelist from the architecture.\n\nOrganised by source table for clarity."
+      },
+      "AllowlistedTable": {
+        "type": "string",
+        "enum": [
+          "silver_paypal_transactions",
+          "silver_erp_invoices",
+          "gold_reconciliation_matches",
+          "gold_anomaly_flags",
+          "gold_journal_headers",
+          "gold_journal_lines"
+        ],
+        "title": "AllowlistedTable",
+        "description": "Tables the LLM is allowed to query. Restricted to Silver (operational\nsource of truth) and Gold (accounting evidence) layers.\nBronze is excluded \u2013 raw payloads must never be exposed to the AI."
+      },
+      "FilterCondition": {
+        "properties": {
+          "column": {
+            "$ref": "#/components/schemas/AllowlistedColumn",
+            "description": "Column to filter on (must be from the whitelist)."
+          },
+          "operator": {
+            "$ref": "#/components/schemas/FilterOperator",
+            "description": "Comparison operator."
+          },
+          "value": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "Filter value. Required for all operators except is_null/is_not_null. For 'in'/'not_in', provide a list. For 'between', provide [low, high]."
+          }
+        },
+        "type": "object",
+        "required": [
+          "column",
+          "operator"
+        ],
+        "title": "FilterCondition",
+        "description": "A single filter condition the LLM wants applied to the query."
+      },
+      "FilterOperator": {
+        "type": "string",
+        "enum": [
+          "eq",
+          "ne",
+          "gt",
+          "gte",
+          "lt",
+          "lte",
+          "like",
+          "ilike",
+          "in",
+          "not_in",
+          "is_null",
+          "is_not_null",
+          "between"
+        ],
+        "title": "FilterOperator",
+        "description": "Allowlisted SQL operators the LLM may use in filter conditions."
+      },
+      "GroupSpec": {
+        "properties": {
+          "column": {
+            "$ref": "#/components/schemas/AllowlistedColumn",
+            "description": "Column to group by."
+          },
+          "aggregate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AggregateFunction"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Aggregate function to apply to grouped rows."
+          },
+          "aggregate_column": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AllowlistedColumn"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Column to aggregate (required if aggregate is set)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "column"
+        ],
+        "title": "GroupSpec",
+        "description": "A grouping specification for server-side grouping in AG Grid."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "InvestigationIntent": {
+        "properties": {
+          "target_table": {
+            "$ref": "#/components/schemas/AllowlistedTable",
+            "description": "Primary table to query. The LLM selects from the allowlisted Silver/Gold tables only."
+          },
+          "join_tables": {
+            "items": {
+              "$ref": "#/components/schemas/AllowlistedTable"
+            },
+            "type": "array",
+            "title": "Join Tables",
+            "description": "Additional tables to JOIN (the compiler resolves FK relationships)."
+          },
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/FilterCondition"
+            },
+            "type": "array",
+            "title": "Filters",
+            "description": "WHERE clause conditions. All are ANDed together."
+          },
+          "sorts": {
+            "items": {
+              "$ref": "#/components/schemas/SortSpec"
+            },
+            "type": "array",
+            "title": "Sorts",
+            "description": "ORDER BY specifications."
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/GroupSpec"
+            },
+            "type": "array",
+            "title": "Groups",
+            "description": "GROUP BY with optional aggregates for the SSRM datasource."
+          },
+          "limit": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "description": "Maximum rows to return (maps to AG Grid block size).",
+            "default": 100
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Offset",
+            "description": "Pagination offset.",
+            "default": 0
+          },
+          "explanation": {
+            "type": "string",
+            "minLength": 10,
+            "title": "Explanation",
+            "description": "Human-readable explanation of what this investigation does, suitable for display in the AG Grid Investigation Studio."
+          },
+          "suggested_actions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Suggested Actions",
+            "description": "Recommended follow-up actions for the FinOps manager."
+          }
+        },
+        "type": "object",
+        "required": [
+          "target_table",
+          "explanation"
+        ],
+        "title": "InvestigationIntent",
+        "description": "The AI-to-Grid Contract \u2013 the ONLY schema Gemini is allowed to produce.\n\nThis Pydantic model is the physical decoupling boundary between\nprobabilistic AI reasoning and deterministic financial execution.\nThe LLM produces structured intent; the Read-Only Query Compiler\ntranslates it into allowlisted, parameterised SQLAlchemy queries.\n\nThe LLM NEVER sees or produces SQL."
+      },
+      "InvestigationRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 3,
+            "title": "Query",
+            "description": "Natural language investigation query."
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id",
+            "description": "Tenant context for multi-tenant isolation."
+          },
+          "requested_by": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Requested By",
+            "description": "Authenticated user initiating the investigation.",
+            "default": "anonymous"
+          },
+          "max_results": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Max Results",
+            "description": "Maximum rows the user wants returned.",
+            "default": 100
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "InvestigationRequest",
+        "description": "Inbound request from the FinOps manager."
+      },
+      "InvestigationResponse": {
+        "properties": {
+          "investigation_id": {
+            "type": "string",
+            "title": "Investigation Id",
+            "description": "Unique identifier for this investigation."
+          },
+          "original_query": {
+            "type": "string",
+            "title": "Original Query",
+            "description": "The user's original query (PII-scrubbed)."
+          },
+          "ai_explanation": {
+            "type": "string",
+            "title": "Ai Explanation",
+            "description": "Gemini's human-readable explanation of the investigation."
+          },
+          "suggested_actions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Suggested Actions",
+            "description": "AI-suggested follow-up actions."
+          },
+          "intent": {
+            "$ref": "#/components/schemas/InvestigationIntent",
+            "description": "The structured AI-to-Grid Contract that was compiled."
+          },
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Columns",
+            "description": "Ordered list of column names in the result set."
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/InvestigationResultRow"
+            },
+            "type": "array",
+            "title": "Rows",
+            "description": "Result rows."
+          },
+          "total_count": {
+            "type": "integer",
+            "title": "Total Count",
+            "description": "Total rows matching (before pagination).",
+            "default": 0
+          },
+          "kpi": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Kpi",
+            "description": "Pre-computed KPI aggregates: total_trapped_working_capital, dollars_reconciled, dollars_requiring_review."
+          },
+          "pii_scrubbed": {
+            "type": "boolean",
+            "title": "Pii Scrubbed",
+            "description": "Whether PII minimisation was applied.",
+            "default": false
+          },
+          "pii_categories": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Pii Categories",
+            "description": "PII categories that were detected and scrubbed."
+          },
+          "executed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Executed At",
+            "description": "Timestamp of query execution."
+          },
+          "query_duration_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query Duration Ms",
+            "description": "Database query execution time in milliseconds."
+          }
+        },
+        "type": "object",
+        "required": [
+          "original_query",
+          "ai_explanation",
+          "intent",
+          "columns"
+        ],
+        "title": "InvestigationResponse",
+        "description": "Complete response from the AI Investigation pipeline."
+      },
+      "InvestigationResultRow": {
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data",
+            "description": "Column name \u2192 value mapping for this row."
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "InvestigationResultRow",
+        "description": "A single row in the investigation result set."
+      },
+      "MatchStatus": {
+        "type": "string",
+        "enum": [
+          "matched",
+          "partial",
+          "unmatched",
+          "disputed",
+          "review_required"
+        ],
+        "title": "MatchStatus",
+        "description": "Lifecycle state of a match."
+      },
+      "OverrideRequestPayload": {
+        "properties": {
+          "override_status": {
+            "$ref": "#/components/schemas/MatchStatus"
+          },
+          "review_notes": {
+            "type": "string",
+            "title": "Review Notes"
+          },
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action"
+          },
+          "four_eyes_proposer": {
+            "type": "string",
+            "title": "Four Eyes Proposer",
+            "default": "finops_analyst"
+          }
+        },
+        "type": "object",
+        "required": [
+          "override_status",
+          "review_notes"
+        ],
+        "title": "OverrideRequestPayload",
+        "description": "FinOps controller cell override request."
+      },
+      "PayPalWebhookPayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id",
+            "description": "PayPal Webhook Event ID"
+          },
+          "event_type": {
+            "type": "string",
+            "title": "Event Type",
+            "description": "E.g. PAYMENT.CAPTURE.COMPLETED, CHECKOUT.ORDER.APPROVED"
+          },
+          "resource_type": {
+            "type": "string",
+            "title": "Resource Type",
+            "description": "Resource type",
+            "default": "capture"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary",
+            "description": "Event summary narrative"
+          },
+          "resource": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Resource",
+            "description": "Full webhook resource payload"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "event_type",
+          "resource"
+        ],
+        "title": "PayPalWebhookPayload",
+        "description": "Incoming PayPal Webhook JSON simulation model."
+      },
+      "SSRMRequest": {
+        "properties": {
+          "startRow": {
+            "type": "integer",
+            "title": "Startrow",
+            "default": 0
+          },
+          "endRow": {
+            "type": "integer",
+            "title": "Endrow",
+            "default": 100
+          },
+          "rowGroupCols": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Rowgroupcols"
+          },
+          "valueCols": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Valuecols"
+          },
+          "groupKeys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Groupkeys"
+          },
+          "filterModel": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Filtermodel"
+          },
+          "sortModel": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Sortmodel"
+          }
+        },
+        "type": "object",
+        "title": "SSRMRequest",
+        "description": "AG Grid Server-Side Row Model request shape."
+      },
+      "SortDirection": {
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "title": "SortDirection",
+        "description": "Sort direction."
+      },
+      "SortSpec": {
+        "properties": {
+          "column": {
+            "$ref": "#/components/schemas/AllowlistedColumn",
+            "description": "Column to sort by."
+          },
+          "direction": {
+            "$ref": "#/components/schemas/SortDirection",
+            "default": "asc"
+          }
+        },
+        "type": "object",
+        "required": [
+          "column"
+        ],
+        "title": "SortSpec",
+        "description": "A single sort specification."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "InvoiceStatus": {
+        "type": "string",
+        "description": "Lifecycle status of an AP invoice.",
+        "enum": [
+          "DRAFT",
+          "APPROVED",
+          "PENDING_SETTLEMENT",
+          "PAID",
+          "DISPUTED",
+          "CANCELLED"
+        ]
+      },
+      "CurrencyCode": {
+        "type": "string",
+        "description": "ISO 4217 currency code.",
+        "enum": [
+          "INR",
+          "USD",
+          "EUR",
+          "GBP",
+          "AED",
+          "SGD"
+        ],
+        "example": "INR"
+      },
+      "Invoice": {
+        "type": "object",
+        "required": [
+          "internal_invoice_id",
+          "vendor_id",
+          "vendor_name",
+          "invoice_date",
+          "due_date",
+          "erp_amount",
+          "currency",
+          "status"
+        ],
+        "properties": {
+          "internal_invoice_id": {
+            "type": "string",
+            "pattern": "^INV-[0-9]{4}-[0-9]{4}$",
+            "example": "INV-2026-0001"
+          },
+          "vendor_id": {
+            "type": "string",
+            "example": "VND-100001"
+          },
+          "vendor_name": {
+            "type": "string",
+            "example": "Tata Consultancy Services Ltd"
+          },
+          "vendor_email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "email",
+            "example": "accounts@tcs.com"
+          },
+          "invoice_date": {
+            "type": "string",
+            "format": "date",
+            "example": "2026-10-01"
+          },
+          "due_date": {
+            "type": "string",
+            "format": "date",
+            "example": "2026-10-31"
+          },
+          "erp_amount": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "example": 485000.0
+          },
+          "currency": {
+            "$ref": "#/components/schemas/CurrencyCode"
+          },
+          "status": {
+            "$ref": "#/components/schemas/InvoiceStatus"
+          }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "required": [
+          "page",
+          "page_size",
+          "total_records",
+          "total_pages"
+        ],
+        "properties": {
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "example": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "example": 25
+          },
+          "total_records": {
+            "type": "integer",
+            "minimum": 0,
+            "example": 15
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0,
+            "example": 1
+          }
+        }
+      },
+      "InvoiceListResponse": {
+        "type": "object",
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Invoice"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        }
+      },
+      "Vendor": {
+        "type": "object",
+        "required": [
+          "vendor_id",
+          "vendor_name",
+          "payment_terms_days",
+          "default_currency",
+          "active"
+        ],
+        "properties": {
+          "vendor_id": {
+            "type": "string",
+            "example": "VND-100001"
+          },
+          "vendor_name": {
+            "type": "string",
+            "example": "Tata Consultancy Services Ltd"
+          },
+          "vendor_email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "email",
+            "example": "accounts@tcs.com"
+          },
+          "gstin": {
+            "type": "string",
+            "pattern": "^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$",
+            "example": "27AAACT2727Q1ZV"
+          },
+          "pan": {
+            "type": "string",
+            "pattern": "^[A-Z]{5}[0-9]{4}[A-Z]{1}$",
+            "example": "AAACT2727Q"
+          },
+          "payment_terms_days": {
+            "type": "integer",
+            "minimum": 0,
+            "example": 30
+          },
+          "default_currency": {
+            "$ref": "#/components/schemas/CurrencyCode"
+          },
+          "active": {
+            "type": "boolean",
+            "example": true
+          }
+        }
+      },
+      "VendorListResponse": {
+        "type": "object",
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Vendor"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        }
+      },
+      "JournalEntryLine": {
+        "type": "object",
+        "required": [
+          "account_code",
+          "debit",
+          "credit"
+        ],
+        "properties": {
+          "account_code": {
+            "type": "string",
+            "example": "5900-FX-VARIANCE"
+          },
+          "account_name": {
+            "type": "string",
+            "example": "FX Variance Expense"
+          },
+          "debit": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "example": 25.0
+          },
+          "credit": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "example": 0.0
+          },
+          "memo": {
+            "type": "string",
+            "maxLength": 255,
+            "example": "Settlement short by INR 25.00"
+          }
+        }
+      },
+      "JournalEntryRequest": {
+        "type": "object",
+        "required": [
+          "posting_date",
+          "description",
+          "currency",
+          "lines"
+        ],
+        "properties": {
+          "posting_date": {
+            "type": "string",
+            "format": "date",
+            "example": "2026-10-19"
+          },
+          "reference_invoice_id": {
+            "type": "string",
+            "example": "INV-2026-0013"
+          },
+          "paypal_transaction_id": {
+            "type": "string",
+            "example": "7HS40927NB358164C"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 255,
+            "example": "FX drift variance adjustment for INV-2026-0013"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/CurrencyCode"
+          },
+          "lines": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "$ref": "#/components/schemas/JournalEntryLine"
+            }
+          }
+        }
+      },
+      "JournalEntryResponse": {
+        "type": "object",
+        "required": [
+          "journal_entry_id",
+          "status",
+          "posting_date",
+          "currency",
+          "total_debit",
+          "total_credit",
+          "lines",
+          "created_at"
+        ],
+        "properties": {
+          "journal_entry_id": {
+            "type": "string",
+            "example": "JE-2026-000451"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "POSTED",
+              "PENDING_APPROVAL",
+              "REVERSED"
+            ],
+            "example": "POSTED"
+          },
+          "posting_date": {
+            "type": "string",
+            "format": "date",
+            "example": "2026-10-19"
+          },
+          "reference_invoice_id": {
+            "type": "string",
+            "example": "INV-2026-0013"
+          },
+          "paypal_transaction_id": {
+            "type": "string",
+            "example": "7HS40927NB358164C"
+          },
+          "description": {
+            "type": "string",
+            "example": "FX drift variance adjustment for INV-2026-0013"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/CurrencyCode"
+          },
+          "total_debit": {
+            "type": "number",
+            "format": "double",
+            "example": 25.0
+          },
+          "total_credit": {
+            "type": "number",
+            "format": "double",
+            "example": 25.0
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JournalEntryLine"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-10-19T09:42:17Z"
+          }
+        }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": [
+          "field",
+          "issue"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "example": "page_size"
+          },
+          "issue": {
+            "type": "string",
+            "example": "Must be between 1 and 100"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "example": "INVALID_REQUEST"
+          },
+          "message": {
+            "type": "string",
+            "example": "One or more request parameters are invalid."
+          },
+          "request_id": {
+            "type": "string",
+            "example": "req-3c90a1ee"
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ErrorDetail"
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Bad request. The request is malformed or contains invalid parameters.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "INVALID_REQUEST",
+              "message": "One or more request parameters are invalid.",
+              "request_id": "req-3c90a1ee",
+              "details": [
+                {
+                  "field": "page_size",
+                  "issue": "Must be between 1 and 100"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Unauthorized. Missing or invalid bearer token.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "UNAUTHORIZED",
+              "message": "Authentication credentials are missing or invalid.",
+              "request_id": "req-7d4412bc",
+              "details": []
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Forbidden. The caller lacks permission for this operation.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "FORBIDDEN",
+              "message": "You do not have permission to access this resource.",
+              "request_id": "req-92ae5530",
+              "details": []
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Too many requests. Rate limit exceeded.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying.",
+            "schema": {
+              "type": "integer",
+              "example": 30
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "RATE_LIMIT_EXCEEDED",
+              "message": "Rate limit exceeded. Retry after 30 seconds.",
+              "request_id": "req-5e08d7a1",
+              "details": []
+            }
+          }
+        }
+      },
+      "InternalServerError": {
+        "description": "Internal server error.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "INTERNAL_ERROR",
+              "message": "An unexpected error occurred.",
+              "request_id": "req-a41f66c9",
+              "details": []
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}

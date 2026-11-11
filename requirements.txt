@@ -1,0 +1,35 @@
+# ==============================================================================
+# Ask-Your-Payments Backend & Execution Worker Dependencies
+# Team CrackerX · FinOps Hackathon 2026
+# ==============================================================================
+
+# Core Framework & ASGI Server
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.28.0,<1.0.0
+websockets>=12.0
+
+# Settings, Validation & Schemas
+pydantic>=2.7.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
+email-validator>=2.0.0
+python-multipart>=0.0.9
+
+# Persistence, ORM & Async Database Drivers
+SQLAlchemy[asyncio]>=2.0.28,<3.0.0
+greenlet>=3.0.0
+sqlmodel>=0.0.16
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+
+# HTTP Clients & Environment
+httpx>=0.27.0
+httpx2>=2.13.1
+python-dotenv>=1.0.1
+
+# Google Gemini AI SDK
+google-genai>=1.0.0
+
+# APIMatic Python SDK Build & Runtime Requirements
+poetry-core>=2.0.0
+certifi>=2024.7.4
+typing-extensions>=4.13.0
