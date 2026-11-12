@@ -31,6 +31,7 @@ import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
@@ -2119,6 +2120,201 @@ async def reject_match(
             "notes": rejection_notes,
             "proposer_email": txn.proposer_email if txn else (mem_txn.get("proposer_email") if mem_txn else "analyst@finops.corp"),
             "approver_email": None,
+        },
+    }
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LOCAL FILE INGESTION ENDPOINT (Hardwired — No File Picker)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post(
+    "/api/ingest-local",
+    status_code=status.HTTP_200_OK,
+    summary="Hardwired Local-File Ingestion (Demo — No File Picker)",
+    tags=["Ingestion"],
+)
+async def ingest_local_csv_files(
+    db: AsyncSession = Depends(get_session),
+) -> Any:
+    """
+    Hardwired Bronze-layer ingestion for the Devpost demo video.
+
+    Reads `side_a_erp.csv` and `side_b_paypal.csv` directly from the backend
+    working directory using Pandas (no multipart upload required).  Inserts raw
+    rows into the Bronze staging table with SHA-256 deduplication, then
+    immediately runs the deterministic LEFT-JOIN reconciliation engine so the
+    AG Grid can display fully-classified Silver rows on the first refresh.
+
+    Returns 200 OK with the reconciled rows so the frontend can call
+    `gridApi.refreshServerSide({ purge: true })` and show real data instantly.
+    """
+    import pandas as pd
+
+    base_dir = Path(__file__).parent.resolve()
+    erp_path = base_dir / "side_a_erp.csv"
+    paypal_path = base_dir / "side_b_paypal.csv"
+
+    # ── 1. Read CSVs with Pandas ────────────────────────────────────────────
+    if not erp_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"ERP CSV not found at: {erp_path}",
+        )
+    if not paypal_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"PayPal CSV not found at: {paypal_path}",
+        )
+
+    try:
+        df_erp = pd.read_csv(erp_path, dtype=str).fillna("")
+        df_paypal = pd.read_csv(paypal_path, dtype=str).fillna("")
+    except Exception as exc:
+        logger.error("[INGEST-LOCAL] Failed to read CSV files: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"CSV read error: {exc}",
+        )
+
+    erp_rows = df_erp.to_dict(orient="records")
+    paypal_rows = df_paypal.to_dict(orient="records")
+
+    logger.info(
+        "[INGEST-LOCAL] Read %d ERP rows from %s, %d PayPal rows from %s",
+        len(erp_rows), erp_path.name, len(paypal_rows), paypal_path.name,
+    )
+
+    # ── 2. Determine Bronze source IDs ──────────────────────────────────────
+    def _get_source_event_id(row: dict, candidates: list) -> str:
+        for k in candidates:
+            v = str(row.get(k, "")).strip()
+            if v:
+                return v
+        raw = json.dumps(row, sort_keys=True)
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    erp_id_candidates = ["erp_txn_id", "internal_invoice_id", "transaction_id", "invoice_id", "id"]
+    pp_id_candidates = ["paypal_transaction_id", "erp_reference_id", "transaction_id", "id"]
+
+    # ── 3. Clear stale Bronze rows and re-insert fresh rows ─────────────────
+    try:
+        await db.execute(
+            delete(BronzeEvent).where(
+                BronzeEvent.source.in_([
+                    IngestionSource.ERP_CSV.value,
+                    IngestionSource.PAYPAL_SETTLEMENT_CSV.value,
+                ])
+            )
+        )
+
+        bronze_entries: list[dict] = []
+
+        for row in erp_rows:
+            raw_json = json.dumps(row, ensure_ascii=False, sort_keys=True)
+            payload_hash = hashlib.sha256(raw_json.encode()).hexdigest()
+            bronze_entries.append({
+                "source": IngestionSource.ERP_CSV.value,
+                "source_event_id": _get_source_event_id(row, erp_id_candidates),
+                "raw_payload": raw_json,
+                "payload_hash": payload_hash,
+                "ingested_at": datetime.now(timezone.utc),
+                "ingested_by": "ingest_local_endpoint",
+            })
+
+        for row in paypal_rows:
+            raw_json = json.dumps(row, ensure_ascii=False, sort_keys=True)
+            payload_hash = hashlib.sha256(raw_json.encode()).hexdigest()
+            bronze_entries.append({
+                "source": IngestionSource.PAYPAL_SETTLEMENT_CSV.value,
+                "source_event_id": _get_source_event_id(row, pp_id_candidates),
+                "raw_payload": raw_json,
+                "payload_hash": payload_hash,
+                "ingested_at": datetime.now(timezone.utc),
+                "ingested_by": "ingest_local_endpoint",
+            })
+
+        if bronze_entries:
+            stmt = (
+                pg_insert(BronzeEvent)
+                .values(bronze_entries)
+                .on_conflict_do_nothing(constraint="uq_bronze_source_dedup")
+            )
+            await db.execute(stmt)
+            await db.commit()
+
+        logger.info(
+            "[INGEST-LOCAL] Staged %d Bronze events (%d ERP + %d PayPal).",
+            len(bronze_entries), len(erp_rows), len(paypal_rows),
+        )
+    except Exception as exc:
+        await db.rollback()
+        logger.error("[INGEST-LOCAL] Bronze insertion failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Bronze ingestion error: {exc}",
+        )
+
+    # ── 4. Run deterministic reconciliation (Bronze → Silver → unified rows) ─
+    try:
+        result = await run_deterministic_matching(db, erp_rows=erp_rows, paypal_rows=paypal_rows)
+    except Exception as exc:
+        logger.error("[INGEST-LOCAL] Reconciliation failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Reconciliation error: {exc}",
+        )
+
+    unified_rows: list = result.get("rows", []) if isinstance(result, dict) else []
+
+    logger.info(
+        "[INGEST-LOCAL] ✅ SUCCESS — %d ERP + %d PayPal → %d unified Silver rows. "
+        "SETTLED=%d, PENDING_APPROVAL=%d, FAILED=%d",
+        len(erp_rows),
+        len(paypal_rows),
+        len(unified_rows),
+        sum(1 for r in unified_rows if r.get("erp_status") == "SETTLED"),
+        sum(1 for r in unified_rows if r.get("erp_status") == "PENDING_APPROVAL"),
+        sum(1 for r in unified_rows if r.get("erp_status") == "FAILED"),
+    )
+
+    # ── 5. Compute KPI summary ──────────────────────────────────────────────
+    total_vol = sum(float(r.get("amount", 0) or 0) for r in unified_rows)
+    pending_ct = sum(1 for r in unified_rows if (r.get("erp_status") or "").upper() in
+                     ("PENDING_APPROVAL", "PENDING", "PROPOSED", "REVIEW_REQUIRED"))
+    active_locks = sum(1 for r in unified_rows if (r.get("erp_status") or "").upper() == "PENDING_APPROVAL")
+    dlq_ct = sum(1 for r in unified_rows if (r.get("erp_status") or "").upper() in
+                 ("FAILED", "DLQ", "UNMATCHED", "DISPUTED", "REJECTED", "ERROR"))
+    detected_curr = (unified_rows[0].get("currency") if unified_rows else None) or "USD"
+
+    return {
+        "status": "success",
+        "layer": "bronze_to_silver",
+        "message": (
+            f"[INGEST-LOCAL] ✅ Hardwired ingestion complete: "
+            f"{len(erp_rows)} ERP rows + {len(paypal_rows)} PayPal rows → "
+            f"{len(unified_rows)} Silver records reconciled. "
+            f"SETTLED={sum(1 for r in unified_rows if r.get('erp_status') == 'SETTLED')}, "
+            f"PENDING_APPROVAL={active_locks}, "
+            f"FAILED={dlq_ct}"
+        ),
+        "rows": unified_rows,
+        "rowCount": len(unified_rows),
+        "total": len(unified_rows),
+        "lastRow": len(unified_rows),
+        "kpi": {
+            "totalVolume": f"${total_vol:,.2f}",
+            "pendingPayouts": pending_ct,
+            "activeLocks": active_locks,
+            "dlqCount": dlq_ct,
+            "currency": detected_curr,
+        },
+        "summary": {
+            "erp_rows_read": len(erp_rows),
+            "paypal_rows_read": len(paypal_rows),
+            "unified_total": len(unified_rows),
+            "source_files": [str(erp_path.name), str(paypal_path.name)],
         },
     }
 

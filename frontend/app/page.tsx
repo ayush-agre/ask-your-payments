@@ -52,11 +52,10 @@ import "ag-grid-community/styles/ag-grid.css";
 import "ag-grid-community/styles/ag-theme-alpine.css";
 
 // Register AG Grid Modules outside component render cycle (AG Grid v36 standard)
+ModuleRegistry.registerModules([ClientSideRowModelModule, ServerSideRowModelModule]);
 ModuleRegistry.registerModules([
-  ClientSideRowModelModule,
   AllCommunityModule,
   AllEnterpriseModule,
-  ServerSideRowModelModule,
   ServerSideRowModelApiModule,
   ValidationModule,
   RowSelectionModule,
@@ -929,6 +928,92 @@ export default function FinancialStudioCommandCenter() {
       setIsReconciling(false);
     }
   }, [gridApi]);
+
+  // ── Task 1: Hardwired Local Ingestion (No File Picker) ───────────────────
+  // POSTs to /api/ingest-local which reads side_a_erp.csv & side_b_paypal.csv
+  // directly from the backend directory. On success, purges the SSRM cache.
+  const handleIngestLocal = useCallback(async () => {
+    if (isUploading) return;
+    setIsUploading(true);
+    setUploadFlash(null);
+
+    try {
+      const response = await fetch("http://localhost:8000/api/ingest-local", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Ingestion failed (${response.status}): ${errText || response.statusText}`);
+      }
+
+      const result = await response.json();
+      const rows: any[] = result.rows || [];
+
+      const mapped: FinancialGridRow[] = rows.map((r: any, idx: number) => ({
+        id: r.id || r.transaction_id || `local-${idx}`,
+        transaction_id: r.transaction_id || `TXN-${idx + 1}`,
+        timestamp: r.timestamp || new Date().toISOString(),
+        vendor_email: r.vendor_email || "N/A",
+        amount: String(r.amount || "0.00"),
+        currency: r.currency || "USD",
+        erp_status: r.erp_status || "PENDING",
+        notes: r.notes || "—",
+        failure_reason: r.failure_reason ?? null,
+        proposer_email: r.proposer_email ?? null,
+        approver_email: r.approver_email ?? null,
+      }));
+
+      setRowData(mapped);
+      setIsDataIngested(true);
+      setIngestedCount(mapped.length);
+
+      // Update KPI ribbon from server response
+      if (result.kpi) {
+        setMetrics({
+          totalVolume: result.kpi.totalVolume ?? "$0.00",
+          pendingPayouts: result.kpi.pendingPayouts ?? 0,
+          activeLocks: result.kpi.activeLocks ?? 0,
+          dlqCount: result.kpi.dlqCount ?? 0,
+        });
+      }
+
+      // ── Immediately purge SSRM cache so the grid re-fetches ──────────────
+      if (gridApi) {
+        (gridApi as any).refreshServerSide?.({ purge: true });
+        gridApi.refreshCells();
+      }
+
+      setUploadFlash(`STAGED (${mapped.length})`);
+      setTimeout(() => setUploadFlash(null), 4000);
+
+      setCopilotHistory((prev) => [
+        ...prev,
+        {
+          id: `local-ingest-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          role: "system",
+          content: `[LOCAL BRONZE INGESTION] ✅ Hardwired ingestion complete — ${mapped.length} Silver records loaded from side_a_erp.csv + side_b_paypal.csv. ${result.message || ""}`,
+        },
+      ]);
+    } catch (err: any) {
+      console.error("[INGEST-LOCAL] Error:", err);
+      setUploadFlash("INGESTION FAILED");
+      setTimeout(() => setUploadFlash(null), 4000);
+      setCopilotHistory((prev) => [
+        ...prev,
+        {
+          id: `err-local-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          role: "system",
+          content: `[INGESTION ERROR] Local ingestion failed: ${err?.message || "Unknown error"}`,
+        },
+      ]);
+    } finally {
+      setIsUploading(false);
+    }
+  }, [gridApi, isUploading]);
 
   // Simultaneous Multi-File Ingestion Handler (Side A: ERP & Side B: PayPal)
   const handleFileUpload = async (files: FileList | File[]) => {
@@ -3048,14 +3133,9 @@ export default function FinancialStudioCommandCenter() {
             accept=".csv"
             className="hidden"
           />
-          {/* Primary Action Button: INGEST SETTLEMENT DATA */}
+          {/* Primary Action Button: INGEST SETTLEMENT DATA — Hardwired (no file picker) */}
           <button
-            onClick={() => {
-              if (fileInputRef.current) {
-                fileInputRef.current.value = "";
-                fileInputRef.current.click();
-              }
-            }}
+            onClick={() => handleIngestLocal()}
             disabled={isUploading || isReconciling}
             className={`px-3 py-1.5 text-xs font-mono font-bold uppercase tracking-wider rounded-none transition-all border ${
               uploadFlash

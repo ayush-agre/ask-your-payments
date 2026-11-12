@@ -1,0 +1,7 @@
+erp_txn_id,vendor_name,vendor_email,amount,currency,erp_status,timestamp
+INV-2026-0001,TCS Corp,billing@tcs.corp,25000.00,USD,PAID,2026-11-01T10:00:00Z
+INV-2026-0002,Infosys Ltd,accounts@infosys.com,25.00,USD,PENDING,2026-11-01T11:00:00Z
+INV-2026-0003,HCL Technologies,finance@hcl.com,128450.00,USD,PAID,2026-11-01T12:00:00Z
+INV-2026-0004,Wipro Digital,ap@wipro.com,75000.00,USD,PAID,2026-11-01T13:00:00Z
+INV-2026-0005,Tech Mahindra,treasury@techmahindra.com,45000.00,USD,PENDING,2026-11-01T14:00:00Z
+INV-2026-0006,Accenture IN,finance@accenture.in,18500.00,USD,PAID,2026-11-01T15:00:00Z
